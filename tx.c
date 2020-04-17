@@ -53,7 +53,7 @@ static void tx_policy_dump(struct tx_policy *policy)
 	txrx_printk(XRADIO_DBG_MSG, "[TX policy] "
 		"%.1X%.1X%.1X%.1X%.1X%.1X%.1X%.1X"
 		"%.1X%.1X%.1X%.1X%.1X%.1X%.1X%.1X"
-		"%.1X%.1X%.1X%.1X%.1X%.1X%.1X%.1X: %d\n",
+		"%.1X%.1X%.1X%.1X%.1X%.1X%.1X%.1X\n",
 		policy->raw[0] & 0x0F,  policy->raw[0] >> 4,
 		policy->raw[1] & 0x0F,  policy->raw[1] >> 4,
 		policy->raw[2] & 0x0F,  policy->raw[2] >> 4,
@@ -65,8 +65,7 @@ static void tx_policy_dump(struct tx_policy *policy)
 		policy->raw[8] & 0x0F,  policy->raw[8] >> 4,
 		policy->raw[9] & 0x0F,  policy->raw[9] >> 4,
 		policy->raw[10] & 0x0F,  policy->raw[10] >> 4,
-		policy->raw[11] & 0x0F,  policy->raw[11] >> 4,
-		policy->defined);
+		policy->raw[11] & 0x0F,  policy->raw[11] >> 4);
 }
 
 static void xradio_check_go_neg_conf_success(struct xradio_common *hw_priv,
@@ -98,10 +97,9 @@ static void tx_policy_build(const struct xradio_common *hw_priv,
 	struct ieee80211_tx_rate *rates, size_t count)
 {
 	int i, j;
+	struct ieee80211_tx_rate tmp_tx_rate;
 	struct ieee80211_rate * tmp_rate = NULL;
-	unsigned limit = hw_priv->short_frame_max_tx_count;
-	unsigned max_rates_cnt = count;
-	unsigned total = 0;
+	s32 key_sort_value = 0;
 	BUG_ON(rates[0].idx < 0);
 	memset(policy, 0, sizeof(*policy));
 
@@ -112,162 +110,50 @@ static void tx_policy_build(const struct xradio_common *hw_priv,
 	for (i = 0; i < count; ++i) {
 		if(rates[i].idx>=0) {
 			tmp_rate = xradio_get_tx_rate(hw_priv, &rates[i]);
-			txrx_printk(XRADIO_DBG_NIY,"[TX policy] Org %d.%dMps=%d", 
-		            tmp_rate->bitrate/10, tmp_rate->bitrate%10, rates[i].count);
+			txrx_printk(XRADIO_DBG_NIY,"[TX policy] Org %d.%dMps=%d f=%d\n", 
+		            tmp_rate->bitrate/10, tmp_rate->bitrate%10, rates[i].count, rates[i].flags);
 		}
 	}
 	txrx_printk(XRADIO_DBG_NIY,"----------------------------");
 #endif
+
+	//sort rates from minstrel in descending order
+	//insert sort, because the table is only 4-8 elements
+	//11n rates have need to be above 11g/n rates, but typically minstrel doesn't mix 11n and 11b/g anyway
+	#define RATE_SORT_VALUE(rate) ((rate).idx + (((rate).flags & IEEE80211_TX_RC_MCS) << 4))
 	
-	/* minstrel is buggy a little bit, so distille
-	 * incoming rates first.
-	 */
-	/* Sort rates in descending order. */
-	total = rates[0].count;
-	for (i = 1; i < count; ++i) {
-		if (rates[i].idx > rates[i-1].idx) {
-			rates[i].idx = rates[i-1].idx>0?(rates[i-1].idx-1):-1;
+	for(i = 1; i < count; ++i) {
+		j = i;
+		tmp_tx_rate = rates[i];
+		key_sort_value = RATE_SORT_VALUE(tmp_tx_rate);
+		while (j > 0 && RATE_SORT_VALUE(rates[j-1]) < key_sort_value) {
+			rates[j] = rates[j-1];
+			j--;
 		}
-		if (rates[i].idx < 0 || i>=limit) {
-			count = i;
-			break;
-		} else {
-			total += rates[i].count;
-		}
+		rates[j] = tmp_tx_rate;
 	}
 
-	/* Add lowest rate to the end when 11a/n. 
-	 * Don't apply in 11b/g because p2p unsupport 1Mbps.
-	 * TODO: it's better to do this in rate control of mac80211.
-	 */
-	if (((rates[0].flags & IEEE80211_TX_RC_MCS) || 
-		   hw_priv->channel->band == NL80211_BAND_5GHZ) && 
-		  count < max_rates_cnt && rates[count-1].idx != 0) {
-		rates[count].idx   = 0;
-		rates[count].count = rates[0].count;
-		rates[count].flags = rates[0].flags;
-		total += rates[count].count;
-		count++;
-	}
-
-	/* adjust tx count to limit, rates should fall quickly 
-	 * and lower rates should be more retry, because reorder 
-	 * buffer of reciever will be timeout and clear probably.
-	 */
-	if (count < 2) {
-		rates[0].count = limit;
-		total = limit;
-	} else {
-		u8 end_retry = 0;  //the retry should be add to last rate.
-		if (limit > HIGH_RATE_MAX_RETRY) {
-			end_retry = limit - HIGH_RATE_MAX_RETRY;
-			limit     = HIGH_RATE_MAX_RETRY;
-		}
-		for (i = 0; (limit != total) && (i < 100); ++i) {  //i<100 to avoid dead loop
-			j = i % count;
-			if(limit < total) {
-				total += (rates[j].count > 1? -1 : 0);
-				rates[j].count += (rates[j].count > 1? -1 : 0);
-			} else {
-				j = count - 1 - j;
-				if (rates[j].count > 0) {
-					total++;
-					rates[j].count++;
-				}
+#if 0
+	//idea from allwinner bsp:
+	//inject fallback rates from 11n to 11b/g to recover quicker from signal drops
+	//seems to just makes things worse
+	if(rates[0].flags & IEEE80211_TX_RC_MCS) {
+		for(i = 1; i < IEEE80211_TX_MAX_RATES; i++)
+		{
+			if(rates[i].idx < 0) break;
+			if(rates[i].idx == 0) {
+				//inject 4x 1Mbps (802.11b) directly into policy field
+				policy->tbl[0] = __cpu_to_le32(0x04);
+				policy->retry_count = 4;
+				break;
 			}
 		}
-		if (end_retry) {
-			rates[count-1].count += end_retry;
-			limit += end_retry;
-		}
 	}
+#endif
+
+	//TODO: minstrel/mac80211 can set IEEE80211_TX_RC_USE_RTS_CTS for individual frames
 	
-	/* Eliminate duplicates. */
-	total = rates[0].count;
-	for (i = 0, j = 1; j < count; ++j) {
-		if (rates[j].idx == rates[i].idx) {
-			rates[i].count += rates[j].count;
-		} else if (rates[j].idx > rates[i].idx) {
-			break;
-		} else {
-			++i;
-			if (i != j)
-				rates[i] = rates[j];
-		}
-		total += rates[j].count;
-	}
-	count = i + 1;
-
-	/* Re-fill policy trying to keep every requested rate and with
-	 * respect to the global max tx retransmission count. 
-	 */
-	if (limit < count)
-		limit = count;
-	if (total > limit) {
-		for (i = 0; i < count; ++i) {
-			int left = count - i - 1;
-			if (rates[i].count > limit - left)
-				rates[i].count = limit - left;
-			limit -= rates[i].count;
-		}
-	}
-
-	/* HACK!!! Device has problems (at least) switching from
-	 * 54Mbps CTS to 1Mbps. This switch takes enormous amount
-	 * of time (100-200 ms), leading to valuable throughput drop.
-	 * As a workaround, additional g-rates are injected to the
-	 * policy.
-	 */
-	if (count == 2 && !(rates[0].flags & IEEE80211_TX_RC_MCS) &&
-			rates[0].idx > 4 && rates[0].count > 2 &&
-			rates[1].idx < 2) {
-		/* ">> 1" is an equivalent of "/ 2", but faster */
-		int mid_rate = (rates[0].idx + 4) >> 1;
-
-		/* Decrease number of retries for the initial rate */
-		rates[0].count -= 2;
-
-		if (mid_rate != 4) {
-			/* Keep fallback rate at 1Mbps. */
-			rates[3] = rates[1];
-
-			/* Inject 1 transmission on lowest g-rate */
-			rates[2].idx = 4;
-			rates[2].count = 1;
-			rates[2].flags = rates[1].flags;
-
-			/* Inject 1 transmission on mid-rate */
-			rates[1].idx = mid_rate;
-			rates[1].count = 1;
-
-			/* Fallback to 1 Mbps is a really bad thing,
-			 * so let's try to increase probability of
-			 * successful transmission on the lowest g rate
-			 * even more */
-			if (rates[0].count >= 3) {
-				--rates[0].count;
-				++rates[2].count;
-			}
-
-			/* Adjust amount of rates defined */
-			count += 2;
-		} else {
-			/* Keep fallback rate at 1Mbps. */
-			rates[2] = rates[1];
-
-			/* Inject 2 transmissions on lowest g-rate */
-			rates[1].idx = 4;
-			rates[1].count = 2;
-
-			/* Adjust amount of rates defined */
-			count += 1;
-		}
-	}
-	
-	tmp_rate = (struct ieee80211_rate *)xradio_get_tx_rate(hw_priv, &rates[0]);
-	if(tmp_rate)
-		policy->defined = tmp_rate->hw_value + 1;
-
+	/* create policy field: 4 bit retry counter per rate */
 	for (i = 0; i < count; ++i) {
 		register unsigned rateid, off, shift, retries;
 		
@@ -289,32 +175,19 @@ static void tx_policy_build(const struct xradio_common *hw_priv,
 		            tmp_rate->bitrate/10, tmp_rate->bitrate%10, retries);
 	}
 	
-	txrx_printk(XRADIO_DBG_MSG, "[TX policy] Dst Policy (%d): " \
-		"%d:%d, %d:%d, %d:%d, %d:%d, %d:%d\n",
+	txrx_printk(XRADIO_DBG_MSG, "[TX policy] Policy (%d): " \
+		"%d:%d (%d), %d:%d (%d), %d:%d (%d), %d:%d (%d)\n",
 		count,
-		rates[0].idx, rates[0].count,
-		rates[1].idx, rates[1].count,
-		rates[2].idx, rates[2].count,
-		rates[3].idx, rates[3].count,
-		rates[4].idx, rates[4].count);
+		rates[0].idx, rates[0].count, rates[0].flags,
+		rates[1].idx, rates[1].count, rates[1].flags,
+		rates[2].idx, rates[2].count, rates[2].flags,
+		rates[3].idx, rates[3].count, rates[3].flags);
 }
 
 static inline bool tx_policy_is_equal(const struct tx_policy *wanted,
 					const struct tx_policy *cached)
 {
-	size_t count = wanted->defined >> 1;
-
-	if (wanted->defined > cached->defined)
-		return false;
-	if (count) {
-		if (memcmp(wanted->raw, cached->raw, count))
-			return false;
-	}
-	if (wanted->defined & 1) {
-		if ((wanted->raw[count] & 0x0F) != (cached->raw[count] & 0x0F))
-			return false;
-	}
-	return true;
+	return !memcmp(wanted->raw, cached->raw, 12);
 }
 
 static int tx_policy_find(struct tx_policy_cache *cache,
@@ -385,7 +258,6 @@ static int tx_policy_get(struct xradio_common *hw_priv,
 		u8 shitf = ((rate&0x7)<<2);
 		u8 off   = (rate>>3);
 		memset(&wanted, 0, sizeof(wanted));
-		wanted.defined = rate + 1;
 		wanted.retry_count = (hw_priv->short_frame_max_tx_count&0xf);
 		wanted.tbl[off] = wanted.retry_count<<shitf;
 		txrx_printk(XRADIO_DBG_NIY, "[TX policy] robust rate=%d\n", rate);
@@ -550,6 +422,16 @@ xradio_get_tx_rate(const struct xradio_common *hw_priv,
 		return &hw_priv->mcs_rates[rate->idx];
 	return &hw_priv->hw->wiphy->bands[hw_priv->channel->band]->
 		bitrates[rate->idx];
+}
+
+inline static s8
+xradio_get_rate_idx_2g(u16 hw_value)
+{
+	if (hw_value < WSM_TRANSMIT_RATE_HT_6)
+		return hw_value;
+	if (hw_value <= WSM_TRANSMIT_RATE_HT_65)
+		return hw_value - WSM_TRANSMIT_RATE_HT_6;
+	return -1;
 }
 
 inline static s8
@@ -1018,7 +900,7 @@ void xradio_tx(struct ieee80211_hw *dev, struct ieee80211_tx_control *control, s
 			llc = skb->data+ieee80211_hdrlen(frame->frame_control) + t.tx_info->control.hw_key->iv_len;
 		else
 			llc = skb->data+ieee80211_hdrlen(frame->frame_control);
-		if (is_dhcp(llc) || is_8021x(llc)) {
+		if (0) { //is_dhcp(llc) || is_8021x(llc)) {
 			t.txpriv.use_bg_rate = 
 			hw_priv->hw->wiphy->bands[hw_priv->channel->band]->bitrates[0].hw_value;
 			if (priv->vif->p2p)
@@ -1171,7 +1053,6 @@ void xradio_tx_confirm_cb(struct xradio_common *hw_priv,
 	struct sk_buff *skb;
 	const struct xradio_txpriv *txpriv;
 	struct xradio_vif *priv;
-	u32    feedback_retry = 0;
 
 	priv = xrwl_hwpriv_to_vifpriv(hw_priv, arg->if_id);
 	if (unlikely(!priv))
@@ -1225,7 +1106,9 @@ void xradio_tx_confirm_cb(struct xradio_common *hw_priv,
 		struct ieee80211_tx_info *tx = IEEE80211_SKB_CB(skb);
 		struct ieee80211_hdr *frame = (struct ieee80211_hdr *)&skb->data[txpriv->offset];
 		int tx_count = arg->ackFailures;
-		u8 ht_flags = 0;
+		u8 ht_flags = IEEE80211_TX_RC_MCS;
+		s8 success_idx = -1;
+		u8 rate_num = 0;
 		int i;
 
 		//yangfh add to reset if_0 in firmware when STA-unjoined,
@@ -1281,80 +1164,75 @@ void xradio_tx_confirm_cb(struct xradio_common *hw_priv,
 		tx->status.ampdu_len = 1;
 		tx->status.ampdu_ack_len = 1;
 
-		txrx_printk(XRADIO_DBG_NIY,"feedback:%08x, %08x, %08x.\n", 
+		txrx_printk(XRADIO_DBG_NIY,"rate_try: %08x, %08x, %08x\n", 
 				         arg->rate_try[2], arg->rate_try[1], arg->rate_try[0]);
-		if(txpriv->use_bg_rate) {   //bg rates
-			tx->status.rates[0].count = arg->ackFailures+1;
-		  tx->status.rates[0].idx   = 0;
-		  tx->status.rates[1].idx   = -1;
-		  tx->status.rates[2].idx   = -1;
-		  tx->status.rates[3].idx   = -1;
-		} else {
-			int j;
-			s8  txed_idx;
-			register u8 rate_num=0, shift=0, retries=0;
-			u8  flag = tx->status.rates[0].flags;
-			
-			//get retry rate idx.
-			for(i=2; i>=0;i--) {
-				if(arg->rate_try[i]) {
-					for(j=7; j>=0;j--) {
-						shift   = j<<2;
-						retries = (arg->rate_try[i]>>shift)&0xf;
-						if(retries) {
-							feedback_retry += retries;
-							txed_idx = xradio_get_rate_idx(hw_priv,flag,((i<<3)+j));
-							txrx_printk(XRADIO_DBG_NIY, "rate_num=%d, hw=%d, idx=%d, "
-							            "retries=%d, flag=%d", rate_num, ((i<<3)+j), 
-							            txed_idx, retries, flag);
-							if(likely(txed_idx>=0)) {
-								tx->status.rates[rate_num].idx   = txed_idx;
-								tx->status.rates[rate_num].count = retries;
-								if (tx->status.rates[rate_num].flags & IEEE80211_TX_RC_MCS)
-									tx->status.rates[rate_num].flags |= ht_flags;
-								rate_num++;
-								if(rate_num>=IEEE80211_TX_MAX_RATES) {
-									i = -1;
-									break;
-								}
-							}
-						}
-					}
+		
+		if(!arg->status) {
+			success_idx = xradio_get_rate_idx_2g(arg->txedRate);
+			//DEBUG
+			//if (arg->txedRate < WSM_TRANSMIT_RATE_6)
+			//	printk("SENT 802.11b FRAME: mode %d\n", arg->txedRate);
+			//if(arg->txQueueDelay > 10000) {
+			//	if(printk_ratelimit())
+			//		printk("SENT FRAME QUEUED FOR: %d ms\n", arg->txQueueDelay/1000);
+			//}
+		}
+		
+		//each nibble of rate_try contains the retries per hw_idx
+		for(i = 2; i >= 0; i--) {
+			u8 hw_idx, retries;
+			s8 nibble, txed_idx;
+			if(likely(!arg->rate_try[i])) continue;
+			for(nibble = 7; nibble >= 0; nibble--) {
+				hw_idx = i*8 + nibble;
+				retries = (arg->rate_try[i] >> (nibble*4)) & 0xf;
+				if(likely(!retries)) continue;
+
+				//table index in either the 11b/g or the 11n rate table
+				//which table is specified by flag
+				txed_idx = xradio_get_rate_idx_2g(hw_idx);
+				if(unlikely(txed_idx < 0)) continue;
+				if(unlikely(success_idx == txed_idx)) {
+					retries++;
+					success_idx = -1;
 				}
+
+				tx->status.rates[rate_num].idx = txed_idx;
+				tx->status.rates[rate_num].count = retries;
+				tx->status.rates[rate_num].flags = hw_idx >= WSM_TRANSMIT_RATE_HT_6 ? ht_flags : 0;
+
+				txrx_printk(XRADIO_DBG_NIY, "rate_num=%d, hw=%d, idx=%d, "
+							"attempts=%d, flags=0x%x", rate_num, hw_idx, 
+							txed_idx, retries, tx->status.rates[rate_num].flags);
+				
+				rate_num++;
+				if(rate_num >= IEEE80211_TX_MAX_RATES)
+					goto rate_table_full;
 			}
-			//clear other rate.
-			for (i=rate_num; i < IEEE80211_TX_MAX_RATES; ++i) {
-				tx->status.rates[i].count = 0;
-				tx->status.rates[i].idx = -1;
-			}
-			//get successful rate idx.
-			if(!arg->status) {
-				txed_idx = xradio_get_rate_idx(hw_priv, flag, arg->txedRate);
-				if(rate_num == 0) {
-					tx->status.rates[0].idx = txed_idx;
-					tx->status.rates[0].count = 1;
-				} else if(rate_num <= IEEE80211_TX_MAX_RATES){
-					--rate_num;
-					if(txed_idx == tx->status.rates[rate_num].idx) {
-						tx->status.rates[rate_num].count += 1;
-					} else if(rate_num<(IEEE80211_TX_MAX_RATES-1)){
-						++rate_num;
-						tx->status.rates[rate_num].idx   = txed_idx;
-						tx->status.rates[rate_num].count = 1;
-					} else if(txed_idx >=0) {
-						tx->status.rates[rate_num].idx   = txed_idx;
-						tx->status.rates[rate_num].count = 1;
-					}
-				}
-			} 
+		}
+		
+rate_table_full:
+
+		if(success_idx >= 0) {
+			rate_num = min(rate_num, (u8)(IEEE80211_TX_MAX_RATES - 1));
+			tx->status.rates[rate_num].idx = success_idx;
+			tx->status.rates[rate_num].count = 1;
+			tx->status.rates[rate_num].flags = arg->txedRate >= WSM_TRANSMIT_RATE_HT_6 ? ht_flags : 0;
+			rate_num++;
+		}
+		
+		for ( ; rate_num < IEEE80211_TX_MAX_RATES; ++rate_num) {
+			tx->status.rates[rate_num].idx = -1;
+			tx->status.rates[rate_num].count = 0;
+			tx->status.rates[rate_num].flags = 0;
 		}
 
-		dev_dbg(hw_priv->pdev, "[TX policy] Ack: " \
-		"%d:%d, %d:%d, %d:%d, %d:%d\n",
-		tx->status.rates[0].idx, tx->status.rates[0].count,
-		tx->status.rates[1].idx, tx->status.rates[1].count,
-		tx->status.rates[2].idx, tx->status.rates[2].count,
-		tx->status.rates[3].idx, tx->status.rates[3].count);
+		dev_dbg(hw_priv->pdev, "[TX retries] Feedback: " \
+		"%d:%d (0x%x), %d:%d (0x%x), %d:%d (0x%x), %d:%d (0x%x)\n",
+		tx->status.rates[0].idx, tx->status.rates[0].count, tx->status.rates[0].flags,
+		tx->status.rates[1].idx, tx->status.rates[1].count, tx->status.rates[1].flags,
+		tx->status.rates[2].idx, tx->status.rates[2].count, tx->status.rates[2].flags,
+		tx->status.rates[3].idx, tx->status.rates[3].count, tx->status.rates[3].flags);
 		
 
 		xradio_queue_remove(queue, arg->packetID);

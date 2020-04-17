@@ -27,7 +27,6 @@ struct tx_policy {
 		__le32 tbl[3];
 		u8 raw[12];
 	};
-	u8  defined;		/* TODO: u32 or u8, profile and select best */
 	u8  usage_count;	/* --// -- */
 	u8  retry_count;	/* --// -- */
 	u8  uploaded;

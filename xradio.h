@@ -90,7 +90,7 @@
 #endif
 
 #define MAX_RATES_STAGE   8   //
-#define MAX_RATES_RETRY   15
+#define MAX_RATES_RETRY   7
 
 #define XRADIO_WORKQUEUE   "xradio_wq"
 #define WIFI_CONF_PATH    "/data/xr_wifi.conf"
