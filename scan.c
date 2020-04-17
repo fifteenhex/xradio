@@ -106,7 +106,7 @@ int xradio_hw_scan(struct ieee80211_hw *hw,
 	struct wsm_template_frame frame = {
 		.frame_type = WSM_FRAME_TYPE_PROBE_REQUEST,
 	};
-	int i;
+	int ret, i;
 
 	/* Scan when P2P_GO corrupt firmware MiniAP mode */
 	if (priv->join_status == XRADIO_JOIN_STATUS_AP) {
@@ -150,13 +150,16 @@ int xradio_hw_scan(struct ieee80211_hw *hw,
 		return -EINVAL;
 	}
 
-	/* TODO by Icenowy: so strange function call */
-	frame.skb = ieee80211_probereq_get(hw, vif->addr, NULL, 0, 0);
+	frame.skb = ieee80211_probereq_get(hw, vif->addr, NULL, 0, req->ie_len);
 	if (!frame.skb) {
 		scan_printk(XRADIO_DBG_ERROR, "%s: ieee80211_probereq_get failed!\n", 
 		            __func__);
 		return -ENOMEM;
 	}
+
+	/* add info elements to probe frame (supported rates) */
+	if (req->ie_len)
+		memcpy(skb_put(frame.skb, req->ie_len), req->ie, req->ie_len);
 
 #ifdef ROAM_OFFLOAD
 	if (priv->join_status != XRADIO_JOIN_STATUS_STA) {
@@ -195,49 +198,46 @@ int xradio_hw_scan(struct ieee80211_hw *hw,
 	/* will be unlocked in xradio_scan_work() */
 	down(&hw_priv->scan.lock);
 	mutex_lock(&hw_priv->conf_mutex);
-
-		if (frame.skb) {
-			int ret = 0;
-			if (priv->if_id == 0)
-				xradio_remove_wps_p2p_ie(&frame);
-			ret = wsm_set_template_frame(hw_priv, &frame, priv->if_id);
-			if (ret) {
-				mutex_unlock(&hw_priv->conf_mutex);
-				up(&hw_priv->scan.lock);
-				dev_kfree_skb(frame.skb);
-				scan_printk(XRADIO_DBG_ERROR, "%s: wsm_set_template_frame failed: %d.\n",
-				             __func__, ret);
-				return ret;
-			}
-		}
-
-		wsm_vif_lock_tx(priv);
-
-		BUG_ON(hw_priv->scan.req);
-		hw_priv->scan.req     = req;
-		hw_priv->scan.n_ssids = 0;
-		hw_priv->scan.status  = 0;
-		hw_priv->scan.begin   = &req->channels[0];
-		hw_priv->scan.curr    = hw_priv->scan.begin;
-		hw_priv->scan.end     = &req->channels[req->n_channels];
-		hw_priv->scan.output_power = hw_priv->output_power;
-		hw_priv->scan.if_id = priv->if_id;
-		/* TODO:COMBO: Populate BIT4 in scanflags to decide on which MAC
-		 * address the SCAN request will be sent */
-
-		for (i = 0; i < req->n_ssids; ++i) {
-			struct wsm_ssid *dst = &hw_priv->scan.ssids[hw_priv->scan.n_ssids];
-			BUG_ON(req->ssids[i].ssid_len > sizeof(dst->ssid));
-			memcpy(&dst->ssid[0], req->ssids[i].ssid, sizeof(dst->ssid));
-			dst->length = req->ssids[i].ssid_len;
-			++hw_priv->scan.n_ssids;
-		}
-
+	
+	if (priv->if_id == 0)
+		xradio_remove_wps_p2p_ie(&frame);
+	ret = wsm_set_template_frame(hw_priv, &frame, priv->if_id);
+	if (ret) {
 		mutex_unlock(&hw_priv->conf_mutex);
+		up(&hw_priv->scan.lock);
+		dev_kfree_skb(frame.skb);
+		scan_printk(XRADIO_DBG_ERROR, "%s: wsm_set_template_frame failed: %d.\n",
+						__func__, ret);
+		return ret;
+	}
 
-		if (frame.skb)
-			dev_kfree_skb(frame.skb);
-		queue_work(hw_priv->workqueue, &hw_priv->scan.work);
+	wsm_vif_lock_tx(priv);
+
+	BUG_ON(hw_priv->scan.req);
+	hw_priv->scan.req     = req;
+	hw_priv->scan.n_ssids = 0;
+	hw_priv->scan.status  = 0;
+	hw_priv->scan.begin   = &req->channels[0];
+	hw_priv->scan.curr    = hw_priv->scan.begin;
+	hw_priv->scan.end     = &req->channels[req->n_channels];
+	hw_priv->scan.output_power = hw_priv->output_power;
+	hw_priv->scan.if_id = priv->if_id;
+	/* TODO:COMBO: Populate BIT4 in scanflags to decide on which MAC
+		* address the SCAN request will be sent */
+
+	for (i = 0; i < req->n_ssids; ++i) {
+		struct wsm_ssid *dst = &hw_priv->scan.ssids[hw_priv->scan.n_ssids];
+		BUG_ON(req->ssids[i].ssid_len > sizeof(dst->ssid));
+		memcpy(&dst->ssid[0], req->ssids[i].ssid, sizeof(dst->ssid));
+		dst->length = req->ssids[i].ssid_len;
+		++hw_priv->scan.n_ssids;
+	}
+
+	mutex_unlock(&hw_priv->conf_mutex);
+
+	if (frame.skb)
+		dev_kfree_skb(frame.skb);
+	queue_work(hw_priv->workqueue, &hw_priv->scan.work);
 
 	return 0;
 }
@@ -444,6 +444,9 @@ void xradio_scan_work(struct work_struct *work)
 
 	} else {
 		struct ieee80211_channel *first = *hw_priv->scan.curr;
+		bool passiveScan = first->flags & IEEE80211_CHAN_NO_IR;
+
+		//verify that all channels to be scanned are same band, active/passive & power
 		for (it = hw_priv->scan.curr + 1, i = 1;
 		     it != hw_priv->scan.end && i < WSM_SCAN_MAX_NUM_OF_CHANNELS;
 		     ++it, ++i) {
@@ -463,13 +466,13 @@ void xradio_scan_work(struct work_struct *work)
 			scan.maxTransmitRate = WSM_TRANSMIT_RATE_1;
 
 		/* TODO: Is it optimal? */
-		scan.numOfProbeRequests = (first->flags & IEEE80211_CHAN_NO_IR) ? 0 : 2;
+		scan.numOfProbeRequests = passiveScan ? 0 : 2;
 
 		scan.numOfSSIDs = hw_priv->scan.n_ssids;
 		scan.ssids = &hw_priv->scan.ssids[0];
 		scan.numOfChannels = it - hw_priv->scan.curr;
 		/* TODO: Is it optimal? */
-		scan.probeDelay = 100;
+		scan.probeDelay = 200;
 		/* It is not stated in WSM specification, however
 		 * FW team says that driver may not use FG scan
 		 * when joined. */
@@ -489,30 +492,28 @@ void xradio_scan_work(struct work_struct *work)
 		maxChannelTime = (maxChannelTime < 35) ? 35 : maxChannelTime;
 		for (i = 0; i < scan.numOfChannels; ++i) {
 			scan.ch[i].number = hw_priv->scan.curr[i]->hw_value;
-
-
-				if (hw_priv->scan.curr[i]->flags & IEEE80211_CHAN_NO_IR) {
-					scan.ch[i].minChannelTime = 50;
-					scan.ch[i].maxChannelTime = 110;
-				} else {
-					scan.ch[i].minChannelTime = 15;
-					scan.ch[i].maxChannelTime = maxChannelTime;
-				}
-
-
+			/* min: time to channel switch if no responses, 
+			*  max: time to listen if transmissions are heard */
+			if (passiveScan) {
+				/* typical AP send beacons with 100TU = 102.4ms interval */
+				scan.ch[i].minChannelTime = 110;
+				scan.ch[i].maxChannelTime = 120;
+			} else {
+				scan.ch[i].minChannelTime = 15;
+				scan.ch[i].maxChannelTime = maxChannelTime;
+			}
 		}
 
-			if (!(first->flags & IEEE80211_CHAN_NO_IR) &&
-			    hw_priv->scan.output_power != first->max_power) {
-			    hw_priv->scan.output_power = first->max_power;
-				/* TODO:COMBO: Change after mac80211 implementation
-				* complete */
-				WARN_ON(wsm_set_output_power(hw_priv, hw_priv->scan.output_power * 10,
-				                             priv->if_id));
-			}
+		if (!passiveScan && hw_priv->scan.output_power != first->max_power) {
+			hw_priv->scan.output_power = first->max_power;
+			/* TODO:COMBO: Change after mac80211 implementation
+			* complete */
+			WARN_ON(wsm_set_output_power(hw_priv, hw_priv->scan.output_power * 10,
+											priv->if_id));
+		}
 
-			down(&hw_priv->scan.status_lock);
-			hw_priv->scan.status = xradio_scan_start(priv, &scan);
+		down(&hw_priv->scan.status_lock);
+		hw_priv->scan.status = xradio_scan_start(priv, &scan);
 
 		kfree(scan.ch);
 		if (WARN_ON(hw_priv->scan.status)) {
