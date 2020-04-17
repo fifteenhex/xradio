@@ -666,15 +666,10 @@ void xradio_bss_info_changed(struct ieee80211_hw *dev,
 	}
 	if (changed & (BSS_CHANGED_ASSOC | BSS_CHANGED_ERP_CTS_PROT)) {
 		u32 prev_erp_info = priv->erp_info;
-		if (priv->join_status == XRADIO_JOIN_STATUS_AP) {
-			if (info->use_cts_prot)
-				priv->erp_info |= WLAN_ERP_USE_PROTECTION;
-			else if (!(prev_erp_info & WLAN_ERP_NON_ERP_PRESENT))
-				priv->erp_info &= ~WLAN_ERP_USE_PROTECTION;
-
-			if (prev_erp_info != priv->erp_info)
-				queue_delayed_work(hw_priv->workqueue, &priv->set_cts_work, 0*HZ);
-		}
+		priv->erp_info = (priv->erp_info & ~WLAN_ERP_USE_PROTECTION) 
+						| (info->use_cts_prot ? WLAN_ERP_USE_PROTECTION : 0);
+		if (prev_erp_info != priv->erp_info)
+			queue_delayed_work(hw_priv->workqueue, &priv->set_cts_work, 0*HZ);
 	}
 
 	if (changed & (BSS_CHANGED_ASSOC | BSS_CHANGED_ERP_SLOT)) {
