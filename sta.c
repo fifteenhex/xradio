@@ -755,10 +755,19 @@ int xradio_get_tx_stats(struct ieee80211_hw *dev,
 
 int xradio_set_pm(struct xradio_vif *priv, const struct wsm_set_pm *arg)
 {
+#ifdef ENABLE_POWERSAVE
 	struct wsm_set_pm pm = *arg;
-
 	if (priv->uapsd_info.uapsdFlags != 0)
 		pm.pmMode &= ~WSM_PSM_FAST_PS_FLAG;
+#else
+	static struct wsm_set_pm pm = 
+	{ 
+		.pmMode = WSM_PSM_ACTIVE,
+		.fastPsmIdlePeriod = 0,
+		.apPsmChangePeriod = 0,
+		.apPsmChangePeriod = 0
+	};
+#endif
 
 	if (memcmp(&pm, &priv->firmware_ps_mode, sizeof(struct wsm_set_pm))) {
 		priv->firmware_ps_mode = pm;
