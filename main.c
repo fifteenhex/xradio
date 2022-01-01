@@ -501,6 +501,9 @@ int xradio_core_init(struct sdio_func* func)
 	struct xradio_common *hw_priv;
 	unsigned char randomaddr[ETH_ALEN];
 	const unsigned char *addr = NULL;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0))
+	u8 addr_buf[ETH_ALEN];
+#endif
 
 	//init xradio_common
 	dev = xradio_init_common(sizeof(struct xradio_common));
@@ -515,7 +518,12 @@ int xradio_core_init(struct sdio_func* func)
 
 	// fill in mac addresses
 	if (hw_priv->pdev->of_node) {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0))
+		of_get_mac_address(hw_priv->pdev->of_node, addr_buf);
+		addr = addr_buf;
+#else
 		addr = of_get_mac_address(hw_priv->pdev->of_node);
+#endif
 	}
 	if (!addr) {
 		dev_warn(hw_priv->pdev, "no mac address provided, using random\n");
