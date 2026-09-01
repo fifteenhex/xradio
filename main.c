@@ -267,6 +267,7 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 	ieee80211_hw_set(hw, SUPPORTS_DYNAMIC_PS);
 	ieee80211_hw_set(hw, REPORTS_TX_ACK_STATUS);
 	ieee80211_hw_set(hw, CONNECTION_MONITOR);
+	ieee80211_hw_set(hw, MFP_CAPABLE);
 
 /*	hw->flags = IEEE80211_HW_SIGNAL_DBM            |
 	            IEEE80211_HW_SUPPORTS_PS           |
