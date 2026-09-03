@@ -225,8 +225,8 @@ int wsm_release_buffer_to_fw(struct xradio_vif *priv, int count)
 			wsm = (struct wsm_hdr *)buf->begin;
 			BUG_ON(buf_len < sizeof(*wsm));
 
-			wsm->id &= __cpu_to_le32(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
-			wsm->id |= cpu_to_le32(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
+			wsm->id &= __cpu_to_le16(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
+			wsm->id |= __cpu_to_le16(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
 
 			dev_dbg(hw_priv->pdev, "REL %d\n", hw_priv->wsm_tx_seq);
 			if (WARN_ON(xradio_data_write(hw_priv, buf->begin, buf_len))) {
@@ -517,7 +517,7 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 
 	/* check wsm length. */
 	wsm = (struct wsm_hdr *) data;
-	wsm_len = __le32_to_cpu(wsm->len);
+	wsm_len = __le16_to_cpu(wsm->len);
 
 	if (WARN_ON(wsm_len > read_len)) {
 		dev_err(hw_priv->pdev, "wsm is bigger than data read, read %zu but frame is %zu\n",
@@ -530,8 +530,8 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 	xradio_bh_rx_dump(hw_priv->pdev, data, wsm_len);
 
 	/* extract wsm id and seq. */
-	wsm_id = __le32_to_cpu(wsm->id) & 0xFFF;
-	wsm_seq = (__le32_to_cpu(wsm->id) >> 13) & 7;
+	wsm_id = __le16_to_cpu(wsm->id) & 0xFFF;
+	wsm_seq = (__le16_to_cpu(wsm->id) >> 13) & 7;
 	skb_trim(skb_rx, wsm_len);
 
 	/* process exceptions. */
@@ -702,7 +702,7 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 		} else {
 			wsm = (struct wsm_hdr *) data;
 			BUG_ON(tx_len < sizeof(*wsm));
-			BUG_ON(__le32_to_cpu(wsm->len) != tx_len);
+			BUG_ON(__le16_to_cpu(wsm->len) != tx_len);
 
 			/* Align tx length and check it. */
 			if (tx_len <= 8)
@@ -715,8 +715,8 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 			}
 
 			/* Make sequence number. */
-			wsm->id &= __cpu_to_le32(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
-			wsm->id |= cpu_to_le32(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
+			wsm->id &= __cpu_to_le16(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
+			wsm->id |= __cpu_to_le16(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
 
 			/* Send the data to devices. */
 			if (WARN_ON(xradio_data_write(hw_priv, data, tx_len))) {
