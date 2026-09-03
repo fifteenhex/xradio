@@ -1708,6 +1708,17 @@ int wsm_cmd_send(struct xradio_common *hw_priv,
 		return -ETIMEDOUT;
 	}
 
+	/* The firmware DMAs each host message into a buffer of the size it
+	 * advertised at startup and has no bounds check of its own, so an
+	 * oversized command corrupts the firmware heap. */
+	if (unlikely(hw_priv->wsm_caps.sizeInpChBuf &&
+		     buf_len > hw_priv->wsm_caps.sizeInpChBuf)) {
+		wsm_buf_reset(buf);
+		wsm_printk(XRADIO_DBG_ERROR, "cmd 0x%.4X too big (%zu > %d)\n",
+			   cmd, buf_len, hw_priv->wsm_caps.sizeInpChBuf);
+		return -EINVAL;
+	}
+
 	/* Fill HI message header */
 	/* BH will add sequence number */
 
@@ -1976,6 +1987,28 @@ int wsm_handle_exception(struct xradio_common *hw_priv, u8 *data, size_t len)
 		"unknown error",
 	};
 
+	/* Assert sites recovered from the fw_xr819.bin disassembly whose
+	 * cause is host-visible; see docs/firmware.md. */
+	static const struct {
+		const char *file;
+		u16 line;
+		u32 code;
+		const char *cause;
+	} assert_causes[] = {
+		{ "hif.c", 879, 0x32,
+		  "host message out of sequence (driver seq desync)" },
+		{ "hif.c", 869, 0x06,
+		  "WSM length field larger than SDIO transfer" },
+		{ "hif.c", 674, 0x05,
+		  "more than 32 outstanding host messages" },
+		{ "hif.c", 437, 0x30,
+		  "64 messages queued to host, host not draining" },
+		{ "tx_wsm_req_01.c", 142, 0x01,
+		  "tx descriptor pool exhausted (buffer accounting broken)" },
+		{ "hi_msg.c", 424, 0x07, "firmware message heap exhausted" },
+		{ "hi_msg.c", 450, 0x08, "firmware message heap exhausted" },
+	};
+
 #if defined(CONFIG_XRADIO_USE_EXTENSIONS)
 	/* Send the event upwards on the FW exception */
 	xradio_pm_stay_awake(&hw_priv->pm_state, 3*HZ);
@@ -2003,6 +2036,16 @@ int wsm_handle_exception(struct xradio_common *hw_priv, u8 *data, size_t len)
 	} else {
 		dev_err(hw_priv->pdev, "Firmware assert at %.*s, line %d, reason=0x%x\n",
 			       (int) sizeof(fname), fname, reg[1], reg[2]);
+		for (i = 0; i < ARRAY_SIZE(assert_causes); ++i) {
+			if (reg[1] == assert_causes[i].line &&
+			    reg[2] == assert_causes[i].code &&
+			    !strncmp(fname, assert_causes[i].file,
+				     sizeof(fname))) {
+				dev_err(hw_priv->pdev, "Likely cause: %s\n",
+					assert_causes[i].cause);
+				break;
+			}
+		}
 	}
 
 	for (i = 0; i < 12; i += 4) {
