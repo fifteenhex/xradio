@@ -536,8 +536,11 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 
 	/* process exceptions. */
 	if (wsm_id == 0) {
-		printk("wtf?\n");
-		ret = 0;
+		/* A zero id is not a valid confirm or indication. Drop it but
+		 * count it as rx progress so the BH keeps draining, and do not
+		 * touch wsm_rx_seq (this frame carries no usable seq). */
+		dev_err_ratelimited(hw_priv->pdev, "ignoring wsm message with id 0\n");
+		ret = 1;
 		goto out;
 	} else if (unlikely(wsm_id == 0x0800)) {
 		dev_err(hw_priv->pdev, "firmware exception!\n");
