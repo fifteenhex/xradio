@@ -40,7 +40,12 @@ int wsm_release_buffer_to_fw(struct xradio_vif *priv, int count);
 #endif
 static int xradio_bh(void *arg);
 
-int xradio_register_bh(struct xradio_common *hw_priv)
+/*
+ * (Re)start the BH kthread and reset the per-run BH state. Split out of
+ * xradio_register_bh so the crash-recovery path can restart the thread
+ * without re-initialising the wait queues (which may still have waiters).
+ */
+int xradio_restart_bh(struct xradio_common *hw_priv)
 {
 	int ret = 0;
 
@@ -49,8 +54,6 @@ int xradio_register_bh(struct xradio_common *hw_priv)
 	atomic_set(&hw_priv->bh_suspend, XRADIO_BH_RESUMED);
 	hw_priv->buf_id_tx = 0;
 	hw_priv->buf_id_rx = 0;
-	init_waitqueue_head(&hw_priv->bh_wq);
-	init_waitqueue_head(&hw_priv->bh_evt_wq);
 
 	hw_priv->bh_thread = kthread_run(&xradio_bh, hw_priv, XRADIO_BH_THREAD);
 	if (IS_ERR(hw_priv->bh_thread)) {
@@ -59,6 +62,14 @@ int xradio_register_bh(struct xradio_common *hw_priv)
 	}
 
 	return ret;
+}
+
+int xradio_register_bh(struct xradio_common *hw_priv)
+{
+	init_waitqueue_head(&hw_priv->bh_wq);
+	init_waitqueue_head(&hw_priv->bh_evt_wq);
+
+	return xradio_restart_bh(hw_priv);
 }
 
 void xradio_unregister_bh(struct xradio_common *hw_priv)
@@ -225,8 +236,8 @@ int wsm_release_buffer_to_fw(struct xradio_vif *priv, int count)
 			wsm = (struct wsm_hdr *)buf->begin;
 			BUG_ON(buf_len < sizeof(*wsm));
 
-			wsm->id &= __cpu_to_le32(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
-			wsm->id |= cpu_to_le32(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
+			wsm->id &= __cpu_to_le16(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
+			wsm->id |= __cpu_to_le16(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
 
 			dev_dbg(hw_priv->pdev, "REL %d\n", hw_priv->wsm_tx_seq);
 			if (WARN_ON(xradio_data_write(hw_priv, buf->begin, buf_len))) {
@@ -358,6 +369,7 @@ static int xradio_bh_read_ctrl_reg(struct xradio_common *hw_priv,
 		if (ret) {
 			hw_priv->bh_error = 1;
 			dev_err(hw_priv->pdev, "Failed to read control register.\n");
+			xradio_schedule_recovery(hw_priv);
 		}
 	}
 
@@ -517,7 +529,7 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 
 	/* check wsm length. */
 	wsm = (struct wsm_hdr *) data;
-	wsm_len = __le32_to_cpu(wsm->len);
+	wsm_len = __le16_to_cpu(wsm->len);
 
 	if (WARN_ON(wsm_len > read_len)) {
 		dev_err(hw_priv->pdev, "wsm is bigger than data read, read %zu but frame is %zu\n",
@@ -530,23 +542,49 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 	xradio_bh_rx_dump(hw_priv->pdev, data, wsm_len);
 
 	/* extract wsm id and seq. */
-	wsm_id = __le32_to_cpu(wsm->id) & 0xFFF;
-	wsm_seq = (__le32_to_cpu(wsm->id) >> 13) & 7;
+	wsm_id = __le16_to_cpu(wsm->id) & 0xFFF;
+	wsm_seq = (__le16_to_cpu(wsm->id) >> 13) & 7;
 	skb_trim(skb_rx, wsm_len);
 
 	/* process exceptions. */
 	if (wsm_id == 0) {
-		printk("wtf?\n");
-		ret = 0;
+		/* A zero id is not a valid confirm or indication. Drop it but
+		 * count it as rx progress so the BH keeps draining, and do not
+		 * touch wsm_rx_seq (this frame carries no usable seq). */
+		dev_err_ratelimited(hw_priv->pdev, "ignoring wsm message with id 0\n");
+		ret = 1;
 		goto out;
 	} else if (unlikely(wsm_id == 0x0800)) {
 		dev_err(hw_priv->pdev, "firmware exception!\n");
 		wsm_handle_exception(hw_priv, &data[sizeof(*wsm)],
 				wsm_len - sizeof(*wsm));
+		/* The firmware never returns from its exception handler so
+		 * the device is dead until it is rebooted. Flag it so pending
+		 * and future commands fail immediately instead of each waiting
+		 * out a multi-second timeout, and kick off a chip reboot. */
+		hw_priv->bh_error = 1;
+		xradio_schedule_recovery(hw_priv);
 		ret = -1;
 		goto out;
 	}
 
+	/* The firmware stamps every message with a consecutive 3-bit
+	 * sequence number taken from its output ring index. A repeat means
+	 * we read a stale buffer (e.g. from a bad piggybacked read length);
+	 * processing it again would corrupt the tx buffer accounting, and
+	 * the firmware asserts (hif.c:879) once that drifts. */
+	if (wsm_seq != hw_priv->wsm_rx_seq) {
+		dev_err(hw_priv->pdev,
+			"wsm seq mismatch: expected %d got %d, msgid 0x%.4X\n",
+			hw_priv->wsm_rx_seq, wsm_seq, wsm_id);
+		if (wsm_seq == ((hw_priv->wsm_rx_seq - 1) & 7)) {
+			/* Duplicate of the previous message: drop it. */
+			ret = 1;
+			goto out;
+		}
+		/* A gap means messages were lost; process this one but
+		 * resync so we do not flag every message from now on. */
+	}
 	hw_priv->wsm_rx_seq = (wsm_seq + 1) & 7;
 
 	/* Process tx frames confirm. */
@@ -648,7 +686,14 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 	int ret;
 	u8 *data;
 
-	BUG_ON(hw_priv->hw_bufs_used > hw_priv->wsm_caps.numInpChBufs);
+	/* hw_bufs_used should never exceed the firmware's input-buffer pool.
+	 * If accounting has drifted (e.g. a lost confirm), reboot the chip
+	 * rather than panicking the kernel. */
+	if (WARN_ON(hw_priv->hw_bufs_used > hw_priv->wsm_caps.numInpChBufs)) {
+		hw_priv->bh_error = 1;
+		xradio_schedule_recovery(hw_priv);
+		return -1;
+	}
 	txavailable = hw_priv->wsm_caps.numInpChBufs - hw_priv->hw_bufs_used;
 	if (txavailable) {
 		/* Wake up the devices */
@@ -680,7 +725,7 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 		} else {
 			wsm = (struct wsm_hdr *) data;
 			BUG_ON(tx_len < sizeof(*wsm));
-			BUG_ON(__le32_to_cpu(wsm->len) != tx_len);
+			BUG_ON(__le16_to_cpu(wsm->len) != tx_len);
 
 			/* Align tx length and check it. */
 			if (tx_len <= 8)
@@ -693,8 +738,8 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 			}
 
 			/* Make sequence number. */
-			wsm->id &= __cpu_to_le32(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
-			wsm->id |= cpu_to_le32(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
+			wsm->id &= __cpu_to_le16(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
+			wsm->id |= __cpu_to_le16(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
 
 			/* Send the data to devices. */
 			if (WARN_ON(xradio_data_write(hw_priv, data, tx_len))) {
@@ -722,6 +767,11 @@ static int xradio_bh_exchange(struct xradio_common *hw_priv) {
 	int rxdone;
 	int txdone;
 	u16 nextlen = 0;
+
+	/* Firmware is wedged and a chip reboot has been scheduled; don't
+	 * touch the dead device until recovery stops this thread. */
+	if (unlikely(hw_priv->bh_error))
+		return 0;
 
 	/* query stuck frames in firmware. */
 	if (atomic_xchg(&hw_priv->query_cnt, 0)) {

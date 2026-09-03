@@ -75,7 +75,7 @@ static int __xradio_write(struct xradio_common *hw_priv, u16 addr,
 static inline int __xradio_read_reg32(struct xradio_common *hw_priv,
                                        u16 addr, u32 *val)
 {
-	return __xradio_read(hw_priv, addr, val, sizeof(val), 0);
+	return __xradio_read(hw_priv, addr, val, sizeof(*val), 0);
 }
 
 static inline int __xradio_write_reg32(struct xradio_common *hw_priv,

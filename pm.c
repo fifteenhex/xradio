@@ -171,7 +171,7 @@ static int xradio_pm_init_common(struct xradio_pm_state *pm,
 		pm_printk(XRADIO_DBG_ERROR, "%s:platform_device_add failed(%d)!\n",
 		           __FUNCTION__, ret);
 		platform_driver_unregister(&xradio_power_driver);
-		kfree(pm->pm_dev);
+		platform_device_put(pm->pm_dev);
 		pm->pm_dev = NULL;
 	}
 
@@ -704,6 +704,12 @@ static int __xradio_wow_resume(struct xradio_vif *priv)
 	/* Restore suspend state */
 	state = pm_state_vif->suspend_state;
 	pm_state_vif->suspend_state = NULL;
+
+	/* On the suspend revert path (xradio_wow_suspend undoing a partial
+	 * suspend) this is called for a vif that never saved a state, so
+	 * suspend_state is NULL. Nothing to restore in that case. */
+	if (!state)
+		return 0;
 
 #ifdef ROAM_OFFLOAD
 	if((priv->vif->type == NL80211_IFTYPE_STATION)

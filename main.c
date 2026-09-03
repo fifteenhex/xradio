@@ -25,6 +25,7 @@
 #include "scan.h"
 #include "pm.h"
 #include "sdio.h"
+#include "debugfs.h"
 
 /* TODO: use rates and channels from the device */
 #define RATETAB_ENT(_rate, _rateid, _flags)		\
@@ -184,6 +185,11 @@ static void xradio_set_ifce_comb(struct xradio_common *hw_priv,
 
 	hw_priv->if_limits1[0].types = BIT(NL80211_IFTYPE_STATION);
 	hw_priv->if_limits1[1].max = 1;
+	/* Monitor is deliberately NOT listed here. NL80211_IFTYPE_MONITOR is a
+	 * software interface type, and cfg80211 rejects software types in a
+	 * driver's hardware iface_combinations (wiphy_verify_iface_combinations
+	 * warns and registration fails). Monitor is advertised only in
+	 * wiphy->interface_modes above; mac80211 provides it itself. */
 	hw_priv->if_limits1[1].types = BIT(NL80211_IFTYPE_AP);
 
 	hw_priv->if_limits2[0].max = 2;
@@ -290,7 +296,8 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 	                             BIT(NL80211_IFTYPE_AP)         |
 	                             BIT(NL80211_IFTYPE_MESH_POINT) |
 	                             BIT(NL80211_IFTYPE_P2P_CLIENT) |
-	                             BIT(NL80211_IFTYPE_P2P_GO);
+	                             BIT(NL80211_IFTYPE_P2P_GO)     |
+	                             BIT(NL80211_IFTYPE_MONITOR);
 
 	/* Support only for limited wowlan functionalities */
 	/* TODO by Icenowy: RESTORE THIS */
@@ -425,6 +432,7 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 	hw_priv->query_packetID = 0;
 	atomic_set(&hw_priv->query_cnt, 0);
 	INIT_WORK(&hw_priv->query_work, wsm_query_work);
+	xradio_recovery_init(hw_priv);
 
 #ifdef CONFIG_XRADIO_SUSPEND_POWER_OFF
 	atomic_set(&hw_priv->suspend_state, XRADIO_RESUME);
@@ -440,6 +448,9 @@ void xradio_free_common(struct ieee80211_hw *dev)
 	int i;
 	struct xradio_common *hw_priv = dev->priv;
 
+	/* Stop recovery from re-arming itself while we tear down. */
+	hw_priv->recovery_enabled = false;
+	cancel_work_sync(&hw_priv->recovery_work);
 	cancel_work_sync(&hw_priv->query_work);
 	del_timer_sync(&hw_priv->ba_timer);
 	mutex_destroy(&hw_priv->wsm_oper_lock);
@@ -487,6 +498,8 @@ int xradio_register_common(struct ieee80211_hw *dev)
 	dev_dbg(hw_priv->pdev, "is registered as '%s'\n",
 	           wiphy_name(dev->wiphy));
 
+	xradio_debugfs_init(hw_priv);
+
 	hw_priv->driver_ready = 1;
 	wake_up(&hw_priv->wsm_startup_done);
 	return 0;
@@ -496,11 +509,162 @@ void xradio_unregister_common(struct ieee80211_hw *dev)
 {
 	struct xradio_common *hw_priv = dev->priv;
 
+	xradio_debugfs_deinit(hw_priv);
+
 	if (wiphy_dev(dev->wiphy)) {
 	ieee80211_unregister_hw(dev);
 		SET_IEEE80211_DEV(dev, NULL);
 	}
 	hw_priv->driver_ready = 0;
+}
+
+/*
+ * Firmware crash recovery.
+ *
+ * The XR819 firmware has no error handling on its host interface: any
+ * violated invariant makes it send an exception indication and then spin
+ * forever (see docs/firmware.md). Historically the only way out was to
+ * rmmod/insmod the driver. These helpers reboot the chip in place: reset
+ * the CPU, re-download the firmware, re-initialise the driver-side state
+ * that the one-time probe memset would otherwise have cleared, and then
+ * ask mac80211 to reconfigure the interfaces via ieee80211_restart_hw().
+ */
+
+static void xradio_recovery_reinit_state(struct xradio_common *hw_priv)
+{
+	int i;
+
+	/* Counters that are otherwise only zeroed by the probe-time memset
+	 * in xradio_init_common(). A fresh firmware starts from zero, so the
+	 * host side must match or the sequence/buffer accounting desyncs and
+	 * the firmware asserts again immediately. */
+	hw_priv->hw_bufs_used = 0;
+	for (i = 0; i < XRWL_MAX_VIFS; i++)
+		hw_priv->hw_bufs_used_vif[i] = 0;
+	hw_priv->wsm_tx_seq = 0;
+	hw_priv->wsm_rx_seq = 0;
+	hw_priv->buf_id_tx = 0;
+	hw_priv->buf_id_rx = 0;
+	hw_priv->wsm_caps.firmwareReady = 0;
+	hw_priv->device_can_sleep = 0;
+	hw_priv->query_packetID = 0;
+	atomic_set(&hw_priv->query_cnt, 0);
+
+	/* Release any command that was stuck waiting on the dead firmware so
+	 * the next wsm_cmd_send() does not trip its BUG_ON(wsm_cmd.ptr). */
+	spin_lock(&hw_priv->wsm_cmd.lock);
+	hw_priv->wsm_cmd.done = 1;
+	hw_priv->wsm_cmd.ptr = NULL;
+	hw_priv->wsm_cmd.arg = NULL;
+	hw_priv->wsm_cmd.cmd = 0xFFFF;
+	spin_unlock(&hw_priv->wsm_cmd.lock);
+	wake_up(&hw_priv->wsm_cmd_wq);
+
+	for (i = 0; i < AC_QUEUE_NUM; i++)
+		xradio_queue_clear(&hw_priv->tx_queue[i], XRWL_ALL_IFS);
+}
+
+static int xradio_recovery_reload_fw(struct xradio_common *hw_priv)
+{
+	int ret, if_id;
+
+	ret = xradio_restart_bh(hw_priv);
+	if (ret) {
+		dev_err(hw_priv->pdev, "recovery: restart_bh failed (%d)\n", ret);
+		return ret;
+	}
+
+	ret = xradio_load_firmware(hw_priv);
+	if (ret) {
+		dev_err(hw_priv->pdev, "recovery: load_firmware failed (%d)\n", ret);
+		return ret;
+	}
+
+	sdio_lock(hw_priv);
+	WARN_ON(sdio_set_blk_size(hw_priv, SDIO_BLOCK_SIZE));
+	sdio_unlock(hw_priv);
+
+	if (wait_event_interruptible_timeout(hw_priv->wsm_startup_done,
+			hw_priv->wsm_caps.firmwareReady, 3 * HZ) <= 0) {
+		dev_err(hw_priv->pdev, "recovery: firmware startup timeout\n");
+		return -ETIMEDOUT;
+	}
+
+	WARN_ON(xradio_reg_write_16(hw_priv, HIF_CONTROL_REG_ID, HIF_CTRL_WUP_BIT));
+
+	for (if_id = 0; if_id < xrwl_get_nr_hw_ifaces(hw_priv); if_id++) {
+		WARN_ON(wsm_set_operational_mode(hw_priv, &defaultoperationalmode,
+						 if_id));
+		WARN_ON(wsm_use_multi_tx_conf(hw_priv, true, if_id));
+	}
+
+	return 0;
+}
+
+static void xradio_recovery_work(struct work_struct *work)
+{
+	struct xradio_common *hw_priv =
+		container_of(work, struct xradio_common, recovery_work);
+	int ret;
+
+	hw_priv->recovery_count++;
+	dev_err(hw_priv->pdev, "firmware wedged, rebooting chip (attempt #%u)\n",
+		hw_priv->recovery_count);
+
+	/* Stop the BH thread; it may be spinning on the dead firmware. */
+	if (hw_priv->bh_thread)
+		xradio_unregister_bh(hw_priv);
+	cancel_work_sync(&hw_priv->query_work);
+
+	/* Free the old SDD blob so xradio_parse_sdd()'s BUG_ON(sdd != NULL)
+	 * passes on reload. */
+	xradio_dev_deinit(hw_priv);
+
+	ret = xradio_reset_device(hw_priv);
+	if (ret)
+		dev_warn(hw_priv->pdev, "recovery: chip reset returned %d\n", ret);
+
+	xradio_recovery_reinit_state(hw_priv);
+	hw_priv->bh_error = 0;
+
+	ret = xradio_recovery_reload_fw(hw_priv);
+	if (ret) {
+		hw_priv->bh_error = 1;
+		atomic_set(&hw_priv->recovery_active, 0);
+		dev_err(hw_priv->pdev,
+			"chip reboot failed (%d); device needs rmmod/insmod\n",
+			ret);
+		return;
+	}
+
+	atomic_set(&hw_priv->recovery_active, 0);
+	dev_info(hw_priv->pdev,
+		 "chip reboot complete, asking mac80211 to reconfigure\n");
+	/* Replays add_interface/keys/config through the normal ops. */
+	ieee80211_restart_hw(hw_priv->hw);
+}
+
+void xradio_recovery_init(struct xradio_common *hw_priv)
+{
+	INIT_WORK(&hw_priv->recovery_work, xradio_recovery_work);
+	atomic_set(&hw_priv->recovery_active, 0);
+	hw_priv->recovery_enabled = true;
+	hw_priv->recovery_count = 0;
+}
+
+/*
+ * Kick off a warm chip reboot. Safe to call from any context (BH thread,
+ * WSM command timeout, ...); the actual work runs on hw_priv->workqueue.
+ * The cmpxchg guarantees only one recovery runs at a time.
+ */
+void xradio_schedule_recovery(struct xradio_common *hw_priv)
+{
+	if (!hw_priv->recovery_enabled)
+		return;
+	if (atomic_cmpxchg(&hw_priv->recovery_active, 0, 1))
+		return;
+	if (!queue_work(hw_priv->workqueue, &hw_priv->recovery_work))
+		atomic_set(&hw_priv->recovery_active, 0);
 }
 
 int xradio_core_init(struct sdio_func* func)

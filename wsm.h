@@ -723,6 +723,9 @@ void wsm_query_work(struct work_struct *work);
 int wsm_read_mib(struct xradio_common *hw_priv, u16 mibId, void *buf,
 		 size_t buf_size, size_t arg_size);
 
+/* Firmware memory read (peek), WSM cmd 0x0000. Debug only; see wsm.c. */
+int wsm_fw_read(struct xradio_common *hw_priv, u32 addr, void *dst, u16 len);
+
 /* 3.7 */
 int wsm_write_mib(struct xradio_common *hw_priv, u16 mibId, void *buf,
 		  size_t buf_size, int if_id);
@@ -1271,10 +1274,6 @@ int wsm_beacon_transmit(struct xradio_common *hw_priv,
 			const struct wsm_beacon_transmit *arg,
 			int if_id);
 #endif
-
-int wsm_start_find(struct xradio_common *hw_priv, int if_id);
-
-int wsm_stop_find(struct xradio_common *hw_priv, int if_id);
 
 struct wsm_suspend_resume {
 	/* See 3.52 */

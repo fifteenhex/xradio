@@ -366,6 +366,69 @@ underflow:
 
 /* ******************************************************************** */
 
+/*
+ * Firmware memory read ("peek"), WSM command 0x0000. This command is
+ * implemented by the firmware but never used by the vendor driver; it was
+ * recovered by disassembling fw_xr819.bin (see docs/firmware.md). The
+ * request is { u32 addr; u16 len; u16 flags }, the confirm echoes the
+ * address then returns the bytes. The firmware caps a single read at 1024
+ * bytes. Intended purely for debugging the black-box firmware.
+ */
+struct wsm_fw_mem_read {
+	u32 addr;
+	void *buf;
+	u16 buf_size;
+};
+
+static int wsm_fw_read_confirm(struct xradio_common *hw_priv,
+			       struct wsm_fw_mem_read *arg,
+			       struct wsm_buf *buf)
+{
+	u32 addr_echo = WSM_GET32(buf);
+
+	/* The confirm echoes the requested address; a mismatch means we are
+	 * parsing something else. */
+	if (WARN_ON(addr_echo != arg->addr))
+		return -EINVAL;
+
+	WSM_GET(buf, arg->buf, arg->buf_size);
+	return 0;
+
+underflow:
+	WARN_ON(1);
+	return -EINVAL;
+}
+
+int wsm_fw_read(struct xradio_common *hw_priv, u32 addr, void *dst, u16 len)
+{
+	int ret;
+	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
+	struct wsm_fw_mem_read arg = {
+		.addr = addr,
+		.buf = dst,
+		.buf_size = len,
+	};
+
+	if (len == 0 || len > 1024)
+		return -EINVAL;
+
+	wsm_cmd_lock(hw_priv);
+
+	WSM_PUT32(buf, addr);
+	WSM_PUT16(buf, len);
+	WSM_PUT16(buf, 0);	/* flags: no cache maintenance */
+
+	ret = wsm_cmd_send(hw_priv, buf, &arg, 0x0000, WSM_CMD_TIMEOUT, -1);
+	wsm_cmd_unlock(hw_priv);
+	return ret;
+
+nomem:
+	wsm_cmd_unlock(hw_priv);
+	return -ENOMEM;
+}
+
+/* ******************************************************************** */
+
 int wsm_write_mib(struct xradio_common *hw_priv, u16 mibId, void *_buf,
 			size_t buf_size, int if_id)
 {
@@ -908,32 +971,6 @@ nomem:
 
 /* ******************************************************************** */
 
-int wsm_start_find(struct xradio_common *hw_priv, int if_id)
-{
-	int ret;
-	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
-
-	wsm_cmd_lock(hw_priv);
-	ret = wsm_cmd_send(hw_priv, buf, NULL, 0x0019, WSM_CMD_TIMEOUT, if_id);
-	wsm_cmd_unlock(hw_priv);
-	return ret;
-}
-
-/* ******************************************************************** */
-
-int wsm_stop_find(struct xradio_common *hw_priv, int if_id)
-{
-	int ret;
-	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
-
-	wsm_cmd_lock(hw_priv);
-	ret = wsm_cmd_send(hw_priv, buf, NULL, 0x001A, WSM_CMD_TIMEOUT, if_id);
-	wsm_cmd_unlock(hw_priv);
-	return ret;
-}
-
-/* ******************************************************************** */
-
 int wsm_map_link(struct xradio_common *hw_priv, const struct wsm_map_link *arg,
 		int if_id)
 {
@@ -1181,7 +1218,7 @@ static int wsm_startup_indication(struct xradio_common *hw_priv,
 	hw_priv->wsm_caps.firmwareBuildNumber = WSM_GET16(buf);
 	hw_priv->wsm_caps.firmwareVersion	= WSM_GET16(buf);
 	WSM_GET(buf, &hw_priv->wsm_caps.fw_label[0], WSM_FW_LABEL);
-	hw_priv->wsm_caps.fw_label[WSM_FW_LABEL+1] = 0; /* Do not trust FW too much. */
+	hw_priv->wsm_caps.fw_label[WSM_FW_LABEL] = 0; /* Do not trust FW too much. */
 
 	if (WARN_ON(status))
 		return -EINVAL;
@@ -1708,6 +1745,17 @@ int wsm_cmd_send(struct xradio_common *hw_priv,
 		return -ETIMEDOUT;
 	}
 
+	/* The firmware DMAs each host message into a buffer of the size it
+	 * advertised at startup and has no bounds check of its own, so an
+	 * oversized command corrupts the firmware heap. */
+	if (unlikely(hw_priv->wsm_caps.sizeInpChBuf &&
+		     buf_len > hw_priv->wsm_caps.sizeInpChBuf)) {
+		wsm_buf_reset(buf);
+		wsm_printk(XRADIO_DBG_ERROR, "cmd 0x%.4X too big (%zu > %d)\n",
+			   cmd, buf_len, hw_priv->wsm_caps.sizeInpChBuf);
+		return -EINVAL;
+	}
+
 	/* Fill HI message header */
 	/* BH will add sequence number */
 
@@ -1787,13 +1835,16 @@ int wsm_cmd_send(struct xradio_common *hw_priv,
 					WSM_CMD_LAST_CHANCE_TIMEOUT) <= 0);
 		}
 
-		/* Kill BH thread to report the error to the top layer. */
+		/* A command timeout means the firmware has stopped answering.
+		 * Flag the error and reboot the chip instead of leaving the
+		 * device wedged until rmmod. */
 		hw_priv->bh_error = 1;
 #ifdef BH_USE_SEMAPHORE
 		up(&hw_priv->bh_sem);
 #else
 		wake_up(&hw_priv->bh_wq);
 #endif
+		xradio_schedule_recovery(hw_priv);
 		ret = -ETIMEDOUT;
 	} else {
 		spin_lock(&hw_priv->wsm_cmd.lock);
@@ -1976,6 +2027,28 @@ int wsm_handle_exception(struct xradio_common *hw_priv, u8 *data, size_t len)
 		"unknown error",
 	};
 
+	/* Assert sites recovered from the fw_xr819.bin disassembly whose
+	 * cause is host-visible; see docs/firmware.md. */
+	static const struct {
+		const char *file;
+		u16 line;
+		u32 code;
+		const char *cause;
+	} assert_causes[] = {
+		{ "hif.c", 879, 0x32,
+		  "host message out of sequence (driver seq desync)" },
+		{ "hif.c", 869, 0x06,
+		  "WSM length field larger than SDIO transfer" },
+		{ "hif.c", 674, 0x05,
+		  "more than 32 outstanding host messages" },
+		{ "hif.c", 437, 0x30,
+		  "64 messages queued to host, host not draining" },
+		{ "tx_wsm_req_01.c", 142, 0x01,
+		  "tx descriptor pool exhausted (buffer accounting broken)" },
+		{ "hi_msg.c", 424, 0x07, "firmware message heap exhausted" },
+		{ "hi_msg.c", 450, 0x08, "firmware message heap exhausted" },
+	};
+
 #if defined(CONFIG_XRADIO_USE_EXTENSIONS)
 	/* Send the event upwards on the FW exception */
 	xradio_pm_stay_awake(&hw_priv->pm_state, 3*HZ);
@@ -2003,6 +2076,16 @@ int wsm_handle_exception(struct xradio_common *hw_priv, u8 *data, size_t len)
 	} else {
 		dev_err(hw_priv->pdev, "Firmware assert at %.*s, line %d, reason=0x%x\n",
 			       (int) sizeof(fname), fname, reg[1], reg[2]);
+		for (i = 0; i < ARRAY_SIZE(assert_causes); ++i) {
+			if (reg[1] == assert_causes[i].line &&
+			    reg[2] == assert_causes[i].code &&
+			    !strncmp(fname, assert_causes[i].file,
+				     sizeof(fname))) {
+				dev_err(hw_priv->pdev, "Likely cause: %s\n",
+					assert_causes[i].cause);
+				break;
+			}
+		}
 	}
 
 	for (i = 0; i < 12; i += 4) {
@@ -2103,7 +2186,7 @@ int wsm_handle_rx(struct xradio_common *hw_priv, int id,
 
 	wsm_buf.begin = (u8 *)&wsm[0];
 	wsm_buf.data = (u8 *)&wsm[1];
-	wsm_buf.end = &wsm_buf.begin[__le32_to_cpu(wsm->len)];
+	wsm_buf.end = &wsm_buf.begin[__le16_to_cpu(wsm->len)];
 
 	wsm_printk(XRADIO_DBG_MSG, "<<< 0x%.4X (%d)\n", id,
 			wsm_buf.end - wsm_buf.begin);
@@ -2177,6 +2260,11 @@ int wsm_handle_rx(struct xradio_common *hw_priv, int id,
 		}
 
 		switch (id) {
+		case 0x0400:	/* firmware memory read (peek), debug only */
+			if (likely(wsm_arg))
+				ret = wsm_fw_read_confirm(hw_priv, wsm_arg,
+							  &wsm_buf);
+			break;
 		case 0x0409:
 			/* Note that wsm_arg can be NULL in case of timeout in
 			 * wsm_cmd_send(). */
@@ -2244,8 +2332,6 @@ int wsm_handle_rx(struct xradio_common *hw_priv, int id,
 		case 0x0416: /* switch_channel */
 		case 0x0417: /* start */
 		case 0x0418: /* beacon_transmit */
-		case 0x0419: /* start_find */
-		case 0x041A: /* stop_find */
 		case 0x041B: /* update_ie */
 		case 0x041C: /* map_link */
 			WARN_ON(wsm_arg != NULL);
@@ -2445,10 +2531,13 @@ static bool wsm_handle_tx_data(struct xradio_vif *priv,
 			action = doDrop;
 		}
 		break;
+	case NL80211_IFTYPE_MONITOR:
+		/* Monitor mode: transmit injected frames as-is. */
+		action = doTx;
+		break;
 	case NL80211_IFTYPE_ADHOC:
 	case NL80211_IFTYPE_MESH_POINT:
 		//STUB();
-	case NL80211_IFTYPE_MONITOR:
 	default:
 		action = doDrop;
 		break;

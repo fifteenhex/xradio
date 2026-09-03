@@ -504,6 +504,14 @@ int xradio_queue_requeue(struct xradio_queue *queue, u32 packetID, bool check)
 	xradio_queue_parse_id(packetID, &queue_generation, &queue_id,
 				&item_generation, &item_id, &if_id, &link_id);
 
+	/* item_id is the low 8 bits of a firmware-supplied packetID (0-255)
+	 * but the pool only has queue->capacity entries, so validate it
+	 * before using it as an index. */
+	if (unlikely(item_id >= (unsigned) queue->capacity)) {
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
 	item = &queue->pool[item_id];
 	if (check && item->txpriv.offchannel_if_id == XRWL_GENERIC_IF_ID) {
 		txrx_printk(XRADIO_DBG_MSG, "Requeued frame dropped for "

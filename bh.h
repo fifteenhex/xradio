@@ -19,7 +19,11 @@
 #define SDIO_BLOCK_SIZE (528)
 
 int xradio_register_bh(struct xradio_common *hw_priv);
+int xradio_restart_bh(struct xradio_common *hw_priv);
 void xradio_unregister_bh(struct xradio_common *hw_priv);
+/* Firmware crash recovery: warm-reboot the chip without unloading. */
+void xradio_recovery_init(struct xradio_common *hw_priv);
+void xradio_schedule_recovery(struct xradio_common *hw_priv);
 void xradio_irq_handler(struct xradio_common *hw_priv);
 void xradio_bh_wakeup(struct xradio_common *hw_priv);
 int xradio_bh_suspend(struct xradio_common *hw_priv);
