@@ -2531,10 +2531,13 @@ static bool wsm_handle_tx_data(struct xradio_vif *priv,
 			action = doDrop;
 		}
 		break;
+	case NL80211_IFTYPE_MONITOR:
+		/* Monitor mode: transmit injected frames as-is. */
+		action = doTx;
+		break;
 	case NL80211_IFTYPE_ADHOC:
 	case NL80211_IFTYPE_MESH_POINT:
 		//STUB();
-	case NL80211_IFTYPE_MONITOR:
 	default:
 		action = doDrop;
 		break;

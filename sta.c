@@ -247,6 +247,25 @@ int xradio_add_interface(struct ieee80211_hw *dev,
 
 	ret = WARN_ON(xradio_setup_mac_pvif(priv));
 
+	if (!ret && vif->type == NL80211_IFTYPE_MONITOR) {
+		/* Monitor mode: no association. Put the vif into MONITOR join
+		 * status so xradio_update_filtering() (called from the
+		 * following configure_filter) actually pushes the promiscuous
+		 * rx filter and turns off bssid filtering, and mark it enabled
+		 * so injected frames are accepted by the tx path.
+		 *
+		 * NB: receive relies on the firmware delivering frames for a
+		 * vif that has only had its rx filter set, without an explicit
+		 * role start. That is unverified on hardware; if a bench test
+		 * shows no frames, a wsm_start for the monitor vif is the
+		 * likely missing piece. Injection via the tx path is
+		 * independent of this. */
+		mutex_lock(&hw_priv->conf_mutex);
+		priv->join_status = XRADIO_JOIN_STATUS_MONITOR;
+		atomic_set(&priv->enabled, 1);
+		mutex_unlock(&hw_priv->conf_mutex);
+	}
+
 	return ret;
 }
 
@@ -398,16 +417,17 @@ int xradio_config(struct ieee80211_hw *dev,
 
 	if (changed &
 		(IEEE80211_CONF_CHANGE_MONITOR|IEEE80211_CONF_CHANGE_IDLE)) {
-		/* TBD: It looks like it's transparent
-		 * there's a monitor interface present -- use this
-		 * to determine for example whether to calculate
-		 * timestamps for packets or not, do not use instead
-		 * of filter flags! */
-		wiphy_debug(dev->wiphy, "ignore IEEE80211_CONF_CHANGE_MONITOR (%d)"
+		/* Monitor presence is otherwise transparent to this driver.
+		 * Only bail early if nothing else we act on changed; a channel
+		 * or power change carried alongside must still be applied (a
+		 * monitor interface needs its channel tuned). */
+		wiphy_debug(dev->wiphy, "IEEE80211_CONF_CHANGE_MONITOR (%d)"
 		           "IEEE80211_CONF_CHANGE_IDLE (%d)\n",
 		           (changed & IEEE80211_CONF_CHANGE_MONITOR) ? 1 : 0,
 		           (changed & IEEE80211_CONF_CHANGE_IDLE) ? 1 : 0);
-		return ret;
+		if (!(changed & (IEEE80211_CONF_CHANGE_CHANNEL |
+				 IEEE80211_CONF_CHANGE_POWER)))
+			return ret;
 	}
 
 	down(&hw_priv->scan.lock);
@@ -650,12 +670,18 @@ void xradio_configure_filter(struct ieee80211_hw *hw,
 		/*add for handle ap FIF_PROBE_REQ message,*/
 		priv->rx_filter.promiscuous = 0;
 		priv->rx_filter.fcs = 0;
-		if(NL80211_IFTYPE_AP == priv->vif->type){
+		if (NL80211_IFTYPE_MONITOR == priv->vif->type) {
+			/* Receive everything on the tuned channel. */
+			priv->rx_filter.promiscuous = 1;
+			priv->rx_filter.bssid = 0;
+			priv->rx_filter.fcs = (*total_flags & FIF_FCSFAIL) ? 1 : 0;
+			priv->bf_control.bcn_count = 0;
+		} else if(NL80211_IFTYPE_AP == priv->vif->type){
 			priv->bf_control.bcn_count = 1;
-			priv->rx_filter.bssid = 1; 	
+			priv->rx_filter.bssid = 1;
 		}else{
 			priv->bf_control.bcn_count = 0;
-			priv->rx_filter.bssid = 0; 
+			priv->rx_filter.bssid = 0;
 		}
 #if 0
 		if (priv->listening ^ listening) {

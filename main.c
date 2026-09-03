@@ -185,6 +185,11 @@ static void xradio_set_ifce_comb(struct xradio_common *hw_priv,
 
 	hw_priv->if_limits1[0].types = BIT(NL80211_IFTYPE_STATION);
 	hw_priv->if_limits1[1].max = 1;
+	/* Monitor is deliberately NOT listed here. NL80211_IFTYPE_MONITOR is a
+	 * software interface type, and cfg80211 rejects software types in a
+	 * driver's hardware iface_combinations (wiphy_verify_iface_combinations
+	 * warns and registration fails). Monitor is advertised only in
+	 * wiphy->interface_modes above; mac80211 provides it itself. */
 	hw_priv->if_limits1[1].types = BIT(NL80211_IFTYPE_AP);
 
 	hw_priv->if_limits2[0].max = 2;
@@ -291,7 +296,8 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 	                             BIT(NL80211_IFTYPE_AP)         |
 	                             BIT(NL80211_IFTYPE_MESH_POINT) |
 	                             BIT(NL80211_IFTYPE_P2P_CLIENT) |
-	                             BIT(NL80211_IFTYPE_P2P_GO);
+	                             BIT(NL80211_IFTYPE_P2P_GO)     |
+	                             BIT(NL80211_IFTYPE_MONITOR);
 
 	/* Support only for limited wowlan functionalities */
 	/* TODO by Icenowy: RESTORE THIS */
