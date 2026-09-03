@@ -121,3 +121,76 @@ code — which is why `wsm_handle_exception` prints `reg[1]`/`reg[2]` as
 line/reason. The assert table above is mirrored by the decoder in
 `wsm_handle_exception`. After sending this the firmware never recovers;
 only a full reset + re-download helps.
+
+## Security notes: what can be triggered over the air
+
+Question asked: can crafted 802.11 frames (a remote attacker, or just a
+hostile/degenerate RF environment) trigger firmware bugs? This section
+records an audit of the on-chip receive path in the disassembly. It is
+**not exhaustive** — see the unaudited surfaces at the end.
+
+### Bottom line
+
+The clearly reachable class is **denial of service (wedge the chip),
+not proven memory corruption / code execution.** The firmware has no
+graceful error handling: every violated invariant calls the panic
+routine, which sends exception indication 0x0800 and then spins forever.
+Several asserts sit in the receive/crypto path, so malformed or flooding
+traffic that confuses internal state hangs the chip until it is rebooted
+(which is what the in-driver recovery in `main.c` is for). The receive
+parsers that were audited are bounds-checked; no single-frame overflow
+was found in them.
+
+### Receive-path surfaces audited (found bounded)
+
+- **Frame length / host-buffer overflow.** The receive FIFO validates
+  the PHY-reported length against the buffer size before accepting a
+  frame (`rx_fifo` at fw offset `0x8b80`: `cmp len, max; bhi drop`).
+  Oversized frames are dropped, so an over-length frame cannot overflow
+  the input buffer.
+- **Beacon / probe-response IE parsing.** The firmware parses IEs from
+  received beacons on-chip (beacon-filter feature; the parse loop is at
+  fw offset `0x8f8a`, reached from the receive-indication builder that
+  dispatches on management subtype at `0x8f50`). The walk is guarded
+  (`while ptr < frame_end`); the only defect is a benign 1-byte
+  over-read at the element boundary, still inside the rx buffer. No
+  single-beacon corruption.
+- **Decryption.** Crypto runs on a hardware engine (MMIO at
+  `0x09c40000`/`0x09c50000`/`0x09c10000`). The cipher type comes from
+  the host-installed key descriptor, not from the frame, so no
+  frame-driven key-index out-of-bounds was found in the firmware code.
+
+### The reachable failure mode: DoS by assert-and-hang
+
+Any assert in the receive/crypto path, once tripped, permanently wedges
+the chip. Notable receive-side asserts:
+
+| assert | trigger |
+|--------|---------|
+| `mic.c:295` / `mic.c:301` (0x17/0x18) | crypto free-descriptor list empty — plausibly reachable by flooding encrypted / MIC-bearing frames while the host is slow to drain |
+| `enc.c:798` (0x01) | encryption context pool empty (same shape) |
+| `rx_handler.c:160` (0x27) | rx-descriptor sentinel word `0xaa55ff` corrupted — fires on any internal state corruption in the rx path |
+
+These are consistency/resource checks rather than content-parsing bugs,
+but reaching any of them is a remote DoS.
+
+### Unaudited surfaces (highest remaining risk)
+
+Not yet cleared; these are the classic remote memory-corruption vectors
+in wifi firmware and would be where to look next for an actual
+corruption bug rather than a DoS:
+
+- **Block-Ack / AMPDU reorder buffer.** The driver leaves aggregation
+  "fully controlled by firmware", so there is a sequence-number-indexed
+  reorder window on-chip. A spoofed ADDBA plus crafted sequence numbers
+  is the classic overflow vector; this code was not located/audited.
+- **Fragmentation reassembly.** The defragmentation path was not
+  located or confirmed.
+
+### Driver relevance
+
+The driver cannot fix firmware bugs, but the recovery path turns a
+remote "wedge the chip" from a permanent hang (rmmod/insmod) into a
+brief reboot, and the rx sequence-number validation in `bh.c` stops one
+class of firmware-forwarded-length confusion from corrupting the
+driver's own buffer accounting.
