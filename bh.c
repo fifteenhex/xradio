@@ -40,7 +40,12 @@ int wsm_release_buffer_to_fw(struct xradio_vif *priv, int count);
 #endif
 static int xradio_bh(void *arg);
 
-int xradio_register_bh(struct xradio_common *hw_priv)
+/*
+ * (Re)start the BH kthread and reset the per-run BH state. Split out of
+ * xradio_register_bh so the crash-recovery path can restart the thread
+ * without re-initialising the wait queues (which may still have waiters).
+ */
+int xradio_restart_bh(struct xradio_common *hw_priv)
 {
 	int ret = 0;
 
@@ -49,8 +54,6 @@ int xradio_register_bh(struct xradio_common *hw_priv)
 	atomic_set(&hw_priv->bh_suspend, XRADIO_BH_RESUMED);
 	hw_priv->buf_id_tx = 0;
 	hw_priv->buf_id_rx = 0;
-	init_waitqueue_head(&hw_priv->bh_wq);
-	init_waitqueue_head(&hw_priv->bh_evt_wq);
 
 	hw_priv->bh_thread = kthread_run(&xradio_bh, hw_priv, XRADIO_BH_THREAD);
 	if (IS_ERR(hw_priv->bh_thread)) {
@@ -59,6 +62,14 @@ int xradio_register_bh(struct xradio_common *hw_priv)
 	}
 
 	return ret;
+}
+
+int xradio_register_bh(struct xradio_common *hw_priv)
+{
+	init_waitqueue_head(&hw_priv->bh_wq);
+	init_waitqueue_head(&hw_priv->bh_evt_wq);
+
+	return xradio_restart_bh(hw_priv);
 }
 
 void xradio_unregister_bh(struct xradio_common *hw_priv)
@@ -358,6 +369,7 @@ static int xradio_bh_read_ctrl_reg(struct xradio_common *hw_priv,
 		if (ret) {
 			hw_priv->bh_error = 1;
 			dev_err(hw_priv->pdev, "Failed to read control register.\n");
+			xradio_schedule_recovery(hw_priv);
 		}
 	}
 
@@ -547,10 +559,11 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 		wsm_handle_exception(hw_priv, &data[sizeof(*wsm)],
 				wsm_len - sizeof(*wsm));
 		/* The firmware never returns from its exception handler so
-		 * the device is dead until the module is reloaded. Flag it
-		 * so pending and future commands fail immediately instead
-		 * of each waiting out a multi-second timeout. */
+		 * the device is dead until it is rebooted. Flag it so pending
+		 * and future commands fail immediately instead of each waiting
+		 * out a multi-second timeout, and kick off a chip reboot. */
 		hw_priv->bh_error = 1;
+		xradio_schedule_recovery(hw_priv);
 		ret = -1;
 		goto out;
 	}
@@ -673,7 +686,14 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 	int ret;
 	u8 *data;
 
-	BUG_ON(hw_priv->hw_bufs_used > hw_priv->wsm_caps.numInpChBufs);
+	/* hw_bufs_used should never exceed the firmware's input-buffer pool.
+	 * If accounting has drifted (e.g. a lost confirm), reboot the chip
+	 * rather than panicking the kernel. */
+	if (WARN_ON(hw_priv->hw_bufs_used > hw_priv->wsm_caps.numInpChBufs)) {
+		hw_priv->bh_error = 1;
+		xradio_schedule_recovery(hw_priv);
+		return -1;
+	}
 	txavailable = hw_priv->wsm_caps.numInpChBufs - hw_priv->hw_bufs_used;
 	if (txavailable) {
 		/* Wake up the devices */
@@ -747,6 +767,11 @@ static int xradio_bh_exchange(struct xradio_common *hw_priv) {
 	int rxdone;
 	int txdone;
 	u16 nextlen = 0;
+
+	/* Firmware is wedged and a chip reboot has been scheduled; don't
+	 * touch the dead device until recovery stops this thread. */
+	if (unlikely(hw_priv->bh_error))
+		return 0;
 
 	/* query stuck frames in firmware. */
 	if (atomic_xchg(&hw_priv->query_cnt, 0)) {

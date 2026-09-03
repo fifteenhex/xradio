@@ -558,3 +558,39 @@ int xradio_dev_deinit(struct xradio_common *hw_priv)
 	}
 	return 0;
 }
+
+/*
+ * Put the on-chip CPU back into reset so the download interface returns to
+ * bootloader/access mode and xradio_load_firmware() will re-download the
+ * image. Used by the crash-recovery path to reboot the chip without
+ * unloading the driver.
+ *
+ * NB: this is the software half of the reset. On the bench, asserting
+ * HIF_CONFIG_CPU_RESET_BIT is expected to return the download engine to
+ * access mode, but if a given board needs the mmc-pwrseq reset GPIO / wifi
+ * regulator toggled instead, that power-cycle would have to be added here
+ * (the GPIO is owned by the MMC core, not this driver). Kept minimal and
+ * marked for review because it cannot be verified without hardware.
+ */
+int xradio_reset_device(struct xradio_common *hw_priv)
+{
+	int ret;
+	u32 val32;
+
+	ret = xradio_reg_read_32(hw_priv, HIF_CONFIG_REG_ID, &val32);
+	if (ret < 0) {
+		dev_err(hw_priv->pdev, "reset: can't read config register.\n");
+		return ret;
+	}
+
+	/* Halt the CPU and gate its clock. */
+	val32 |= HIF_CONFIG_CPU_RESET_BIT | HIF_CONFIG_CPU_CLK_DIS_BIT;
+	ret = xradio_reg_write_32(hw_priv, HIF_CONFIG_REG_ID, val32);
+	if (ret < 0) {
+		dev_err(hw_priv->pdev, "reset: can't write config register.\n");
+		return ret;
+	}
+	msleep(5);
+
+	return 0;
+}

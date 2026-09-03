@@ -225,6 +225,12 @@ struct xradio_common {
 	wait_queue_head_t		bh_wq;
 	wait_queue_head_t		bh_evt_wq;
 
+	/* Firmware crash recovery (warm chip reboot without rmmod). */
+	struct work_struct		recovery_work;
+	atomic_t			recovery_active;
+	bool				recovery_enabled;
+	unsigned int			recovery_count;
+
 
 	int				buf_id_tx;	/* byte */
 	int				buf_id_rx;	/* byte */

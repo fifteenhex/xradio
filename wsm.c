@@ -1772,13 +1772,16 @@ int wsm_cmd_send(struct xradio_common *hw_priv,
 					WSM_CMD_LAST_CHANCE_TIMEOUT) <= 0);
 		}
 
-		/* Kill BH thread to report the error to the top layer. */
+		/* A command timeout means the firmware has stopped answering.
+		 * Flag the error and reboot the chip instead of leaving the
+		 * device wedged until rmmod. */
 		hw_priv->bh_error = 1;
 #ifdef BH_USE_SEMAPHORE
 		up(&hw_priv->bh_sem);
 #else
 		wake_up(&hw_priv->bh_wq);
 #endif
+		xradio_schedule_recovery(hw_priv);
 		ret = -ETIMEDOUT;
 	} else {
 		spin_lock(&hw_priv->wsm_cmd.lock);
