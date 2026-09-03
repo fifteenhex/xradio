@@ -231,6 +231,11 @@ struct xradio_common {
 	bool				recovery_enabled;
 	unsigned int			recovery_count;
 
+	/* debugfs */
+	struct dentry			*debug_dir;
+	u32				debug_peek_addr;
+	u32				debug_peek_len;
+
 
 	int				buf_id_tx;	/* byte */
 	int				buf_id_rx;	/* byte */

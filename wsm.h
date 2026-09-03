@@ -723,6 +723,9 @@ void wsm_query_work(struct work_struct *work);
 int wsm_read_mib(struct xradio_common *hw_priv, u16 mibId, void *buf,
 		 size_t buf_size, size_t arg_size);
 
+/* Firmware memory read (peek), WSM cmd 0x0000. Debug only; see wsm.c. */
+int wsm_fw_read(struct xradio_common *hw_priv, u32 addr, void *dst, u16 len);
+
 /* 3.7 */
 int wsm_write_mib(struct xradio_common *hw_priv, u16 mibId, void *buf,
 		  size_t buf_size, int if_id);

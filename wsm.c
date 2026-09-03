@@ -366,6 +366,69 @@ underflow:
 
 /* ******************************************************************** */
 
+/*
+ * Firmware memory read ("peek"), WSM command 0x0000. This command is
+ * implemented by the firmware but never used by the vendor driver; it was
+ * recovered by disassembling fw_xr819.bin (see docs/firmware.md). The
+ * request is { u32 addr; u16 len; u16 flags }, the confirm echoes the
+ * address then returns the bytes. The firmware caps a single read at 1024
+ * bytes. Intended purely for debugging the black-box firmware.
+ */
+struct wsm_fw_mem_read {
+	u32 addr;
+	void *buf;
+	u16 buf_size;
+};
+
+static int wsm_fw_read_confirm(struct xradio_common *hw_priv,
+			       struct wsm_fw_mem_read *arg,
+			       struct wsm_buf *buf)
+{
+	u32 addr_echo = WSM_GET32(buf);
+
+	/* The confirm echoes the requested address; a mismatch means we are
+	 * parsing something else. */
+	if (WARN_ON(addr_echo != arg->addr))
+		return -EINVAL;
+
+	WSM_GET(buf, arg->buf, arg->buf_size);
+	return 0;
+
+underflow:
+	WARN_ON(1);
+	return -EINVAL;
+}
+
+int wsm_fw_read(struct xradio_common *hw_priv, u32 addr, void *dst, u16 len)
+{
+	int ret;
+	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
+	struct wsm_fw_mem_read arg = {
+		.addr = addr,
+		.buf = dst,
+		.buf_size = len,
+	};
+
+	if (len == 0 || len > 1024)
+		return -EINVAL;
+
+	wsm_cmd_lock(hw_priv);
+
+	WSM_PUT32(buf, addr);
+	WSM_PUT16(buf, len);
+	WSM_PUT16(buf, 0);	/* flags: no cache maintenance */
+
+	ret = wsm_cmd_send(hw_priv, buf, &arg, 0x0000, WSM_CMD_TIMEOUT, -1);
+	wsm_cmd_unlock(hw_priv);
+	return ret;
+
+nomem:
+	wsm_cmd_unlock(hw_priv);
+	return -ENOMEM;
+}
+
+/* ******************************************************************** */
+
 int wsm_write_mib(struct xradio_common *hw_priv, u16 mibId, void *_buf,
 			size_t buf_size, int if_id)
 {
@@ -2197,6 +2260,11 @@ int wsm_handle_rx(struct xradio_common *hw_priv, int id,
 		}
 
 		switch (id) {
+		case 0x0400:	/* firmware memory read (peek), debug only */
+			if (likely(wsm_arg))
+				ret = wsm_fw_read_confirm(hw_priv, wsm_arg,
+							  &wsm_buf);
+			break;
 		case 0x0409:
 			/* Note that wsm_arg can be NULL in case of timeout in
 			 * wsm_cmd_send(). */

@@ -17,7 +17,8 @@ xradio_wlan-y := \
 	sdio.o \
 	pm.o \
 	ht.o \
-	p2p.o
+	p2p.o \
+	debugfs.o
 
 ccflags-y += -DCONFIG_XRADIO_USE_EXTENSIONS
 

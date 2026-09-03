@@ -25,6 +25,7 @@
 #include "scan.h"
 #include "pm.h"
 #include "sdio.h"
+#include "debugfs.h"
 
 /* TODO: use rates and channels from the device */
 #define RATETAB_ENT(_rate, _rateid, _flags)		\
@@ -491,6 +492,8 @@ int xradio_register_common(struct ieee80211_hw *dev)
 	dev_dbg(hw_priv->pdev, "is registered as '%s'\n",
 	           wiphy_name(dev->wiphy));
 
+	xradio_debugfs_init(hw_priv);
+
 	hw_priv->driver_ready = 1;
 	wake_up(&hw_priv->wsm_startup_done);
 	return 0;
@@ -499,6 +502,8 @@ int xradio_register_common(struct ieee80211_hw *dev)
 void xradio_unregister_common(struct ieee80211_hw *dev)
 {
 	struct xradio_common *hw_priv = dev->priv;
+
+	xradio_debugfs_deinit(hw_priv);
 
 	if (wiphy_dev(dev->wiphy)) {
 	ieee80211_unregister_hw(dev);
