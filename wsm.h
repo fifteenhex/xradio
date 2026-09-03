@@ -1272,10 +1272,6 @@ int wsm_beacon_transmit(struct xradio_common *hw_priv,
 			int if_id);
 #endif
 
-int wsm_start_find(struct xradio_common *hw_priv, int if_id);
-
-int wsm_stop_find(struct xradio_common *hw_priv, int if_id);
-
 struct wsm_suspend_resume {
 	/* See 3.52 */
 	/* Link ID */

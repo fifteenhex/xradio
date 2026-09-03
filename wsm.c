@@ -908,32 +908,6 @@ nomem:
 
 /* ******************************************************************** */
 
-int wsm_start_find(struct xradio_common *hw_priv, int if_id)
-{
-	int ret;
-	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
-
-	wsm_cmd_lock(hw_priv);
-	ret = wsm_cmd_send(hw_priv, buf, NULL, 0x0019, WSM_CMD_TIMEOUT, if_id);
-	wsm_cmd_unlock(hw_priv);
-	return ret;
-}
-
-/* ******************************************************************** */
-
-int wsm_stop_find(struct xradio_common *hw_priv, int if_id)
-{
-	int ret;
-	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
-
-	wsm_cmd_lock(hw_priv);
-	ret = wsm_cmd_send(hw_priv, buf, NULL, 0x001A, WSM_CMD_TIMEOUT, if_id);
-	wsm_cmd_unlock(hw_priv);
-	return ret;
-}
-
-/* ******************************************************************** */
-
 int wsm_map_link(struct xradio_common *hw_priv, const struct wsm_map_link *arg,
 		int if_id)
 {
@@ -2287,8 +2261,6 @@ int wsm_handle_rx(struct xradio_common *hw_priv, int id,
 		case 0x0416: /* switch_channel */
 		case 0x0417: /* start */
 		case 0x0418: /* beacon_transmit */
-		case 0x0419: /* start_find */
-		case 0x041A: /* stop_find */
 		case 0x041B: /* update_ie */
 		case 0x041C: /* map_link */
 			WARN_ON(wsm_arg != NULL);
