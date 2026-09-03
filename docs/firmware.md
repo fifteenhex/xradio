@@ -49,6 +49,39 @@ as dead code) are **not implemented** by this firmware.
 The startup indication (0x0801) advertises `numInpChBufs = 30`,
 `sizeInpChBuf = 1632`.
 
+### Commands implemented by firmware but never sent by the driver
+
+Of the 37 dispatch slots, 24 are used by the driver and 6 are the shared
+"invalid" stub (0x02, 0x19, 0x1a, 0x1e, 0x1f, 0x21, 0x24 — note
+start_find/stop_find 0x19/0x1a fall here and are dead code in `wsm.c`).
+The remaining slots have real handlers the driver never invokes:
+
+| id | handler | what it does |
+|----|---------|--------------|
+| **0x00** | `0x16025` | **memory READ (peek).** Request = `{u32 addr, u16 len, u16 flags}`; copies `len` bytes (capped at 1024) from `addr` into the confirm. Flag bits select a cache invalidate/clean pass first. Arbitrary read of the whole chip address space — firmware RAM, RF/baseband MMIO at `0x0ab8xxxx`, etc. |
+| **0x01** | `0x16095` | **memory WRITE (poke).** Request = `{u32 addr, u16 len, u16 flags, payload...}`; writes the payload to `addr` (byte/half/word per flags), with a cache clean pass. Arbitrary write of the same space. |
+| 0x03 | `0x15879` | test/echo helper, confirm id 0x403; optionally allocates a buffer |
+| 0x0f | `0x10df7` | config setter (calls an internal MIB-style routine), confirm len 8 |
+| 0x14 | `0x006d0d` | per-interface flag setter (ORs bit 3 of an interface struct), confirm len 12 |
+| 0x15 | `0x10e83` | config setter, confirm len 8 |
+| 0x1d | `0x10f1f` | **table/stats readback**, confirm id 0x41d; returns `count` 12-byte records (`count` from request), i.e. a variable-length telemetry array |
+| 0x20 | `0x10f3f` | config setter, confirm id `0x420|if_id`, confirm len 8 |
+
+The peek/poke pair (0x00/0x01) is the interesting one: it is a complete
+runtime memory-access backdoor into the "black box" that the vendor
+driver never touches. It needs no special unlock — just a normal WSM
+message once the firmware is running. Uses: dumping live firmware RAM to
+correlate against this disassembly, reading RF/PHY registers to diagnose
+the reliability problems, or scripting hardware bring-up without a new
+firmware build. The confirm for 0x00 is bounded to 1024 bytes; 0x01 has
+no length sanity check of its own, so a bad `addr` will fault the CPU and
+trip the exception path.
+
+Note there is **no separate packet-injection command**: raw 802.11 TX is
+the normal data path (id 0x0004), which already sends whatever frame the
+host hands it. Monitor-mode injection therefore works through the
+existing tx path, not a hidden command.
+
 ## Host interface rules (violations crash the firmware)
 
 The firmware has no error paths on its host interface — every violated
