@@ -543,10 +543,32 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 		dev_err(hw_priv->pdev, "firmware exception!\n");
 		wsm_handle_exception(hw_priv, &data[sizeof(*wsm)],
 				wsm_len - sizeof(*wsm));
+		/* The firmware never returns from its exception handler so
+		 * the device is dead until the module is reloaded. Flag it
+		 * so pending and future commands fail immediately instead
+		 * of each waiting out a multi-second timeout. */
+		hw_priv->bh_error = 1;
 		ret = -1;
 		goto out;
 	}
 
+	/* The firmware stamps every message with a consecutive 3-bit
+	 * sequence number taken from its output ring index. A repeat means
+	 * we read a stale buffer (e.g. from a bad piggybacked read length);
+	 * processing it again would corrupt the tx buffer accounting, and
+	 * the firmware asserts (hif.c:879) once that drifts. */
+	if (wsm_seq != hw_priv->wsm_rx_seq) {
+		dev_err(hw_priv->pdev,
+			"wsm seq mismatch: expected %d got %d, msgid 0x%.4X\n",
+			hw_priv->wsm_rx_seq, wsm_seq, wsm_id);
+		if (wsm_seq == ((hw_priv->wsm_rx_seq - 1) & 7)) {
+			/* Duplicate of the previous message: drop it. */
+			ret = 1;
+			goto out;
+		}
+		/* A gap means messages were lost; process this one but
+		 * resync so we do not flag every message from now on. */
+	}
 	hw_priv->wsm_rx_seq = (wsm_seq + 1) & 7;
 
 	/* Process tx frames confirm. */
