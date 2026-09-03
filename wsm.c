@@ -1181,7 +1181,7 @@ static int wsm_startup_indication(struct xradio_common *hw_priv,
 	hw_priv->wsm_caps.firmwareBuildNumber = WSM_GET16(buf);
 	hw_priv->wsm_caps.firmwareVersion	= WSM_GET16(buf);
 	WSM_GET(buf, &hw_priv->wsm_caps.fw_label[0], WSM_FW_LABEL);
-	hw_priv->wsm_caps.fw_label[WSM_FW_LABEL+1] = 0; /* Do not trust FW too much. */
+	hw_priv->wsm_caps.fw_label[WSM_FW_LABEL] = 0; /* Do not trust FW too much. */
 
 	if (WARN_ON(status))
 		return -EINVAL;
