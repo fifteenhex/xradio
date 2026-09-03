@@ -337,7 +337,7 @@ static int xradio_bootloader(struct xradio_common *hw_priv)
 	int ret;
 	u32 i;
 	u32 *data;
-	const struct firmware *bootloader;
+	const struct firmware *bootloader = NULL;
 
 	/* Load a bootloader file */
 	ret = request_firmware(&bootloader, bl_path, hw_priv->pdev);
