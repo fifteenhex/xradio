@@ -416,8 +416,8 @@ int xradio_config(struct ieee80211_hw *dev,
 	/* TODO: IEEE80211_CONF_CHANGE_QOS */
 	/* TODO:COMBO:Change when support is available mac80211*/
 	if (changed & IEEE80211_CONF_CHANGE_POWER) {
-		/*hw_priv->output_power = conf->power_level;*/
-		hw_priv->output_power = 20;
+		/* Keep the existing 20 dBm ceiling. */
+		hw_priv->output_power = min(conf->power_level, 20);
 		wiphy_debug(dev->wiphy, "Config Tx power=%d, but real=%d\n",
 		           conf->power_level, hw_priv->output_power);
 		WARN_ON(wsm_set_output_power(hw_priv, hw_priv->output_power * 10, if_id));
