@@ -81,7 +81,6 @@ int xradio_set_key(struct ieee80211_hw *dev, enum set_key_cmd cmd,
 
 		key->flags |= IEEE80211_KEY_FLAG_PUT_IV_SPACE;
 
-		priv->cipherType = key->cipher;
 		switch (key->cipher) {
 		case WLAN_CIPHER_SUITE_WEP40:
 		case WLAN_CIPHER_SUITE_WEP104:
@@ -163,6 +162,9 @@ int xradio_set_key(struct ieee80211_hw *dev, enum set_key_cmd cmd,
 			ret = -EOPNOTSUPP;
 			goto finally;
 		}
+
+		/* Unsupported keys must not change ARP template encryption. */
+		priv->cipherType = key->cipher;
 		ret = WARN_ON(wsm_add_key(hw_priv, wsm_key, priv->if_id));
 		if (!ret)
 			key->hw_key_idx = idx;
