@@ -216,7 +216,7 @@ void xradio_rx_cb(struct xradio_vif *priv,
 #endif
        
 	if (arg->rxedRate >= 14) {
-		hdr->flag |= RX_ENC_HT;
+		hdr->encoding = RX_ENC_HT;
 		hdr->rate_idx = arg->rxedRate - 14;
 	} else if (arg->rxedRate >= 4) {
 		if (hdr->band == NL80211_BAND_5GHZ)
