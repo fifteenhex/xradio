@@ -504,7 +504,7 @@ struct xradio_vif *xrwl_hwpriv_to_vifpriv(struct xradio_common *hw_priv,
 {
 	struct xradio_vif *vif;
 
-	if (WARN_ON((-1 == if_id) || (if_id > XRWL_MAX_VIFS)))
+	if (WARN_ON((-1 == if_id) || (if_id >= XRWL_MAX_VIFS)))
 		return NULL;
 	/* TODO:COMBO: During scanning frames can be received
 	 * on interface ID 3 */
@@ -526,7 +526,8 @@ static inline
 struct xradio_vif *__xrwl_hwpriv_to_vifpriv(struct xradio_common *hw_priv,
 					      int if_id)
 {
-	WARN_ON((-1 == if_id) || (if_id > XRWL_MAX_VIFS));
+	if (WARN_ON((-1 == if_id) || (if_id >= XRWL_MAX_VIFS)))
+		return NULL;
 	/* TODO:COMBO: During scanning frames can be received
 	 * on interface ID 3 */
 	if (!hw_priv->vif_list[if_id]) {

@@ -89,19 +89,25 @@ static void xradio_queue_post_gc(struct xradio_queue_stats *stats,
 	}
 }
 
-static void xradio_queue_register_post_gc(struct list_head *gc_list,
-				     struct xradio_queue_item *item)
+/* Take a copy of a queue item so it can be destroyed outside of the
+ * queue lock.  Returns NULL when the copy could not be allocated, the
+ * caller then has to leave the frame where it is. */
+static struct xradio_queue_item *
+xradio_queue_get_post_gc(struct xradio_queue_item *item, gfp_t gfp)
 {
 	struct xradio_queue_item *gc_item;
-	gc_item = kmalloc(sizeof(struct xradio_queue_item), GFP_KERNEL);
-	BUG_ON(!gc_item);
+
+	gc_item = kmalloc(sizeof(struct xradio_queue_item), gfp);
+	if (unlikely(!gc_item))
+		return NULL;
 	memcpy(gc_item, item, sizeof(struct xradio_queue_item));
-	list_add_tail(&gc_item->head, gc_list);
+	return gc_item;
 }
 
 static void __xradio_queue_gc(struct xradio_queue *queue,
 			      struct list_head *head,
-			      bool unlock)
+			      bool unlock,
+			      gfp_t gfp)
 {
 	struct xradio_queue_stats *stats = queue->stats;
 	struct xradio_queue_item *item = NULL;
@@ -111,10 +117,18 @@ static void __xradio_queue_gc(struct xradio_queue *queue,
 
 	while (!list_empty(&queue->queue)) {
 		struct xradio_txpriv *txpriv;
+		struct xradio_queue_item *gc_item;
 		item = list_first_entry(
 			&queue->queue, struct xradio_queue_item, head);
 		if (time_before(jiffies, item->queue_timestamp+queue->ttl))
 			break;
+
+		/* Allocate before the accounting is updated so a failure
+		 * leaves the queue untouched. */
+		gc_item = xradio_queue_get_post_gc(item, gfp);
+		if (!gc_item)
+			break;
+		list_add_tail(&gc_item->head, head);
 
 		txpriv = &item->txpriv;
 		if_id = txpriv->if_id;
@@ -131,7 +145,6 @@ static void __xradio_queue_gc(struct xradio_queue *queue,
 		//	xradio_debug_tx_ttl(priv);
 		//	spin_unlock(&priv->vif_lock);
 		//}
-		xradio_queue_register_post_gc(head, item);
 		item->skb = NULL;
 		list_move_tail(&item->head, &queue->free_pool);
 	}
@@ -166,7 +179,9 @@ static void xradio_queue_gc(struct timer_list *t)
 	LIST_HEAD(list);
 
 	spin_lock_bh(&queue->lock);
-	__xradio_queue_gc(queue, &list, true);
+	/* The garbage collector runs from a timer, so the copy needed for
+	 * the deferred destruction cannot sleep. */
+	__xradio_queue_gc(queue, &list, true, GFP_ATOMIC);
 	spin_unlock_bh(&queue->lock);
 	xradio_queue_post_gc(queue->stats, &list);
 }
@@ -263,7 +278,19 @@ int xradio_queue_clear(struct xradio_queue *queue, int if_id)
 			&queue->pending, struct xradio_queue_item, head);
 		WARN_ON(!item->skb);
 		if (XRWL_ALL_IFS == if_id || item->txpriv.if_id == if_id) {
-			xradio_queue_register_post_gc(&gc_list, item);
+			/* queue->lock is held here, so the copy cannot
+			 * sleep. */
+			struct xradio_queue_item *gc_item =
+				xradio_queue_get_post_gc(item, GFP_ATOMIC);
+			if (unlikely(!gc_item)) {
+				/* The frame can no longer be reported through
+				 * mac80211, drop it without taking the kernel
+				 * down.  This only happens when memory is
+				 * completely exhausted. */
+				dev_kfree_skb_any(item->skb);
+			} else {
+				list_add_tail(&gc_item->head, &gc_list);
+			}
 			item->skb = NULL;
 			list_move_tail(&item->head, &queue->free_pool);
 			cnt++;
@@ -504,6 +531,14 @@ int xradio_queue_requeue(struct xradio_queue *queue, u32 packetID, bool check)
 	xradio_queue_parse_id(packetID, &queue_generation, &queue_id,
 				&item_generation, &item_id, &if_id, &link_id);
 
+	/* item_id and the interface id both come from the firmware, so
+	 * they must be validated before they are used as indexes. */
+	if (unlikely(item_id >= (unsigned) queue->capacity) ||
+	    unlikely(if_id >= XRWL_MAX_VIFS)) {
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
 	item = &queue->pool[item_id];
 	if (check && item->txpriv.offchannel_if_id == XRWL_GENERIC_IF_ID) {
 		txrx_printk(XRADIO_DBG_MSG, "Requeued frame dropped for "
@@ -599,16 +634,20 @@ int xradio_queue_remove(struct xradio_queue *queue, u32 packetID)
 	xradio_queue_parse_id(packetID, &queue_generation, &queue_id,
 				&item_generation, &item_id, &if_id, &link_id);
 
+	/* The firmware provides these, so they are checked before they are
+	 * used to index the pool and the per interface counters. */
+	if (unlikely(item_id >= (unsigned) queue->capacity) ||
+	    unlikely(if_id >= XRWL_MAX_VIFS)) {
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
 	item = &queue->pool[item_id];
 
 	spin_lock_bh(&queue->lock);
 	BUG_ON(queue_id != queue->queue_id);
-	/*TODO:COMBO:Add check for interface ID also */
 	if (unlikely(queue_generation != queue->generation)) {
 		ret = -ENOENT;
-	} else if (unlikely(item_id >= (unsigned) queue->capacity)) {
-		WARN_ON(1);
-		ret = -EINVAL;
 	} else if (unlikely(item->generation != item_generation)) {
 		WARN_ON(1);
 		ret = -ENOENT;

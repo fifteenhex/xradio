@@ -52,10 +52,17 @@ int xradio_register_bh(struct xradio_common *hw_priv)
 	init_waitqueue_head(&hw_priv->bh_wq);
 	init_waitqueue_head(&hw_priv->bh_evt_wq);
 
-	hw_priv->bh_thread = kthread_run(&xradio_bh, hw_priv, XRADIO_BH_THREAD);
+	/* Create the thread stopped and take a reference on it before it is
+	 * woken.  The thread exits on its own when the device fails, and
+	 * without the reference kthread_stop() in xradio_unregister_bh()
+	 * would touch a task_struct that is already freed. */
+	hw_priv->bh_thread = kthread_create(&xradio_bh, hw_priv, XRADIO_BH_THREAD);
 	if (IS_ERR(hw_priv->bh_thread)) {
 		ret = PTR_ERR(hw_priv->bh_thread);
 		hw_priv->bh_thread = NULL;
+	} else {
+		get_task_struct(hw_priv->bh_thread);
+		wake_up_process(hw_priv->bh_thread);
 	}
 
 	return ret;
@@ -70,9 +77,8 @@ void xradio_unregister_bh(struct xradio_common *hw_priv)
 
 	hw_priv->bh_thread = NULL;
 	kthread_stop(thread);
-#ifdef HAS_PUT_TASK_STRUCT
+	/* Release the reference taken in xradio_register_bh(). */
 	put_task_struct(thread);
-#endif
 	dev_dbg(hw_priv->pdev, "Unregister success.\n");
 }
 
@@ -178,6 +184,9 @@ int wsm_release_tx_buffer(struct xradio_common *hw_priv, int count)
 		*/
 		dev_err(hw_priv->pdev, "hw_bufs_used=%d, count=%d.\n",
 				hw_priv->hw_bufs_used, count);
+		/* The firmware confirmed a frame it was never given.  Keep
+		 * the counter sane instead of letting it drift negative. */
+		hw_priv->hw_bufs_used = 0;
 		ret = -1;
 	} else if (hw_bufs_used >= (hw_priv->wsm_caps.numInpChBufs - 1))
 		ret = 1;
@@ -190,12 +199,17 @@ int wsm_release_vif_tx_buffer(struct xradio_common *hw_priv, int if_id, int coun
 {
 	int ret = 0;
 
+	if (WARN_ON(if_id < 0 || if_id >= XRWL_MAX_VIFS))
+		return -1;
+
 	hw_priv->hw_bufs_used_vif[if_id] -= count;
+	if (WARN_ON(hw_priv->hw_bufs_used_vif[if_id] < 0)) {
+		hw_priv->hw_bufs_used_vif[if_id] = 0;
+		ret = -1;
+	}
 	if (!hw_priv->hw_bufs_used_vif[if_id])
 		wake_up(&hw_priv->bh_evt_wq);
 
-	if (WARN_ON(hw_priv->hw_bufs_used_vif[if_id] < 0))
-		ret = -1;
 	return ret;
 }
 #ifdef MCAST_FWDING
@@ -225,8 +239,8 @@ int wsm_release_buffer_to_fw(struct xradio_vif *priv, int count)
 			wsm = (struct wsm_hdr *)buf->begin;
 			BUG_ON(buf_len < sizeof(*wsm));
 
-			wsm->id &= __cpu_to_le32(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
-			wsm->id |= cpu_to_le32(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
+			wsm->id &= cpu_to_le16(~WSM_TX_SEQ(WSM_TX_SEQ_MAX) & 0xFFFF);
+			wsm->id |= cpu_to_le16(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
 
 			dev_dbg(hw_priv->pdev, "REL %d\n", hw_priv->wsm_tx_seq);
 			if (WARN_ON(xradio_data_write(hw_priv, buf->begin, buf_len))) {
@@ -467,10 +481,14 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 	size_t alloc_len;
 	u8 *data;
 	int ret;
+	int avail_len;
 
-	read_len = *nextlen > 0 ? *nextlen : xradio_bh_rx_availlen(hw_priv);
-	if(read_len <= 0)
-		return read_len;
+	/* xradio_bh_rx_availlen() reports errors as negative values, so the
+	 * availability has to be kept signed until it has been checked. */
+	avail_len = *nextlen > 0 ? (int)*nextlen : xradio_bh_rx_availlen(hw_priv);
+	if (avail_len <= 0)
+		return avail_len;
+	read_len = avail_len;
 
 	if (read_len < sizeof(struct wsm_hdr) || (read_len > EFFECTIVE_BUF_SIZE)) {
 		dev_err(hw_priv->pdev, "Invalid read len: %zu", read_len);
@@ -508,11 +526,10 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 		goto out;
 	}
 
-	/* the ctrl register is appened to the end of the wsm frame
-	 * so we can use this to avoid reading the control register
-	 * again for the next read .. but if this is invalid we'll
-	 * do an invalid read and the firmware will crash so this
-	 * probably needs some sort of validation */
+	/* The control register is piggybacked onto the data we just read and
+	 * is the last two bytes of the transfer.  This is the same offset the
+	 * vendor driver and the cw1200 driver use, so keep it in step with
+	 * alloc_len even though that is the SDIO aligned size. */
 	*nextlen = READLEN(__le16_to_cpu(((__le16 *) data)[(alloc_len >> 1) - 1]));
 
 	/* check wsm length. */
@@ -543,6 +560,9 @@ static int xradio_bh_rx(struct xradio_common *hw_priv, u16* nextlen) {
 		dev_err(hw_priv->pdev, "firmware exception!\n");
 		wsm_handle_exception(hw_priv, &data[sizeof(*wsm)],
 				wsm_len - sizeof(*wsm));
+		/* The firmware is dead.  Tell the rest of the driver so that
+		 * it does not keep talking to a dead device. */
+		hw_priv->bh_error = 1;
 		ret = -1;
 		goto out;
 	}
@@ -648,7 +668,15 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 	int ret;
 	u8 *data;
 
-	BUG_ON(hw_priv->hw_bufs_used > hw_priv->wsm_caps.numInpChBufs);
+	if (unlikely(hw_priv->hw_bufs_used > hw_priv->wsm_caps.numInpChBufs)) {
+		/* The firmware confirmed more frames than it was ever
+		 * given.  Do not take the kernel down over the device
+		 * losing track of its buffers, just clamp the counter. */
+		dev_err(hw_priv->pdev, "hw_bufs_used=%d > numInpChBufs=%d\n",
+				hw_priv->hw_bufs_used,
+				hw_priv->wsm_caps.numInpChBufs);
+		hw_priv->hw_bufs_used = hw_priv->wsm_caps.numInpChBufs;
+	}
 	txavailable = hw_priv->wsm_caps.numInpChBufs - hw_priv->hw_bufs_used;
 	if (txavailable) {
 		/* Wake up the devices */
@@ -693,8 +721,8 @@ static int xradio_bh_tx(struct xradio_common *hw_priv){
 			}
 
 			/* Make sequence number. */
-			wsm->id &= __cpu_to_le32(~WSM_TX_SEQ(WSM_TX_SEQ_MAX));
-			wsm->id |= cpu_to_le32(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
+			wsm->id &= cpu_to_le16(~WSM_TX_SEQ(WSM_TX_SEQ_MAX) & 0xFFFF);
+			wsm->id |= cpu_to_le16(WSM_TX_SEQ(hw_priv->wsm_tx_seq));
 
 			/* Send the data to devices. */
 			if (WARN_ON(xradio_data_write(hw_priv, data, tx_len))) {
@@ -741,7 +769,7 @@ static int xradio_bh_exchange(struct xradio_common *hw_priv) {
 			break;
 		}
 	} while ((txdone > 0 || rxdone > 0) && !kthread_should_stop());
-	return 0;
+	return hw_priv->bh_error ? -1 : 0;
 }
 
 static int xradio_bh(void *arg)
@@ -755,8 +783,15 @@ static int xradio_bh(void *arg)
 	for (;;) {
 		timeout = HZ / 30;
 
-		// wait for something to happen or a timeout
-		status = wait_event_interruptible_timeout(hw_priv->bh_wq, ( {
+		/* An error was reported from outside the thread (or the
+		 * firmware is gone).  Stop servicing the device. */
+		if (hw_priv->bh_error)
+			break;
+
+		/* wait for something to happen or a timeout.  The thread is
+		 * not interruptible so a stray signal cannot tear it down and
+		 * leave the driver without a data path. */
+		status = wait_event_timeout(hw_priv->bh_wq, ( {
 					wake = atomic_xchg(&hw_priv->bh_tx, 0);
 					term = kthread_should_stop();
 					suspend = atomic_read(&hw_priv->bh_suspend);
@@ -768,10 +803,6 @@ static int xradio_bh(void *arg)
 			}
 		} else if (term) {
 			dev_dbg(hw_priv->pdev, "xradio_bh exit!\n");
-			break;
-		} else if (status < 0) {
-			dev_err(hw_priv->pdev, "bh_error=%d, status=%ld\n",
-					hw_priv->bh_error, status);
 			break;
 		} else if (!status) {
 			/* check if there is data waiting but we missed the interrupt*/
@@ -806,25 +837,33 @@ static int xradio_bh(void *arg)
 			  //continue;
 			  //}
 		} else if (suspend) {
-			dev_dbg(hw_priv->pdev, "Host suspend request.\n");
-			/* Check powersave setting again. */
-			if (hw_priv->powersave_enabled) {
-				dev_dbg(hw_priv->pdev,
+			/* A resume can arrive before the thread gets here, when a
+			 * suspend request timed out while the thread was busy.
+			 * Do not overwrite it with the parked state, that would
+			 * leave the thread parked with nobody left to wake it. */
+			if (XRADIO_BH_RESUME !=
+			    atomic_read(&hw_priv->bh_suspend)) {
+				dev_dbg(hw_priv->pdev, "Host suspend request.\n");
+				/* Check powersave setting again. */
+				if (hw_priv->powersave_enabled) {
+					dev_dbg(hw_priv->pdev,
 						"Device idle(host suspend), can sleep.\n");
-				WARN_ON(xradio_reg_write_16(hw_priv, HIF_CONTROL_REG_ID, 0));
-				hw_priv->device_can_sleep = true;
-			}
+					WARN_ON(xradio_reg_write_16(hw_priv,
+								HIF_CONTROL_REG_ID, 0));
+					hw_priv->device_can_sleep = true;
+				}
 
-			/* bh thread go to suspend. */
-			atomic_set(&hw_priv->bh_suspend, XRADIO_BH_SUSPENDED);
-			wake_up(&hw_priv->bh_evt_wq);
-			status = wait_event_interruptible(hw_priv->bh_wq,
-					XRADIO_BH_RESUME == atomic_read(&hw_priv->bh_suspend));
+				/* bh thread go to suspend. */
+				atomic_set(&hw_priv->bh_suspend,
+						XRADIO_BH_SUSPENDED);
+				wake_up(&hw_priv->bh_evt_wq);
+				wait_event(hw_priv->bh_wq,
+						XRADIO_BH_RESUME ==
+							atomic_read(&hw_priv->bh_suspend) ||
+						kthread_should_stop());
 
-			if (status < 0) {
-				dev_err(hw_priv->pdev, "Failed to wait for resume: %ld.\n",
-						status);
-				break;
+				if (kthread_should_stop())
+					break;
 			}
 			dev_dbg(hw_priv->pdev, "Host resume.\n");
 			atomic_set(&hw_priv->bh_suspend, XRADIO_BH_RESUMED);
@@ -832,7 +871,22 @@ static int xradio_bh(void *arg)
 		}
 	} /* for (;;)*/
 
-	dev_err(hw_priv->pdev, "bh thread exiting\n");
+	/*
+	 * If this is not a requested shutdown the device is no longer being
+	 * serviced.  Mark the driver as failed and wake every waiter so that
+	 * callers return an error instead of hanging the kernel on a device
+	 * that will never answer again.
+	 */
+	if (!kthread_should_stop()) {
+		hw_priv->bh_error = 1;
+		wake_up(&hw_priv->bh_evt_wq);
+		wake_up(&hw_priv->wsm_cmd_wq);
+		wake_up(&hw_priv->wsm_startup_done);
+		wake_up(&hw_priv->tx_queue_stats.wait_link_id_empty);
+	}
+
+	dev_err(hw_priv->pdev, "bh thread exiting, error=%d\n",
+			hw_priv->bh_error);
 
 	return 0;
 }

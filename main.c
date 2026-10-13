@@ -25,6 +25,7 @@
 #include "scan.h"
 #include "pm.h"
 #include "sdio.h"
+#include "main.h"
 
 /* TODO: use rates and channels from the device */
 #define RATETAB_ENT(_rate, _rateid, _flags)		\
@@ -218,7 +219,7 @@ static void xradio_set_ifce_comb(struct xradio_common *hw_priv,
 	hw->wiphy->n_iface_combinations = 3;
 }
 
-struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
+static struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 {
 	int i;
 	struct ieee80211_hw *hw;
@@ -350,6 +351,10 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 	sema_init(&hw_priv->tx_lock_sem, 1);
 
 	hw_priv->workqueue = create_singlethread_workqueue(XRADIO_WORKQUEUE);
+	if (!hw_priv->workqueue) {
+		ieee80211_free_hw(hw);
+		return NULL;
+	}
 	sema_init(&hw_priv->scan.lock, 1);
 	sema_init(&hw_priv->scan.status_lock,1);
 	INIT_WORK(&hw_priv->scan.work, xradio_scan_work);
@@ -377,6 +382,7 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 #endif
 	if (unlikely(xradio_queue_stats_init(&hw_priv->tx_queue_stats,
 			WLAN_LINK_ID_MAX,sizeof(int[WLAN_LINK_ID_MAX]),xradio_skb_dtor, hw_priv))) {
+		destroy_workqueue(hw_priv->workqueue);
 		ieee80211_free_hw(hw);
 		return NULL;
 	}
@@ -386,6 +392,7 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 			for (; i > 0; i--)
 				xradio_queue_deinit(&hw_priv->tx_queue[i - 1]);
 			xradio_queue_stats_deinit(&hw_priv->tx_queue_stats);
+			destroy_workqueue(hw_priv->workqueue);
 			ieee80211_free_hw(hw);
 			return NULL;
 		}
@@ -435,20 +442,21 @@ struct ieee80211_hw *xradio_init_common(size_t hw_priv_data_len)
 	return hw;
 }
 
-void xradio_free_common(struct ieee80211_hw *dev)
+static void xradio_free_common(struct ieee80211_hw *dev)
 {
 	int i;
 	struct xradio_common *hw_priv = dev->priv;
 
 	cancel_work_sync(&hw_priv->query_work);
 	del_timer_sync(&hw_priv->ba_timer);
+	/* Stop all work before the mutexes they use are destroyed. */
+	flush_workqueue(hw_priv->workqueue);
+	destroy_workqueue(hw_priv->workqueue);
+	hw_priv->workqueue = NULL;
 	mutex_destroy(&hw_priv->wsm_oper_lock);
 	mutex_destroy(&hw_priv->conf_mutex);
 	mutex_destroy(&hw_priv->wsm_cmd_mux);
 	wsm_buf_deinit(&hw_priv->wsm_cmd_buf);
-	flush_workqueue(hw_priv->workqueue);
-	destroy_workqueue(hw_priv->workqueue);
-	hw_priv->workqueue = NULL;
 
 	xradio_deinit_resv_skb(hw_priv);
 	if (hw_priv->skb_cache) {
@@ -460,10 +468,9 @@ void xradio_free_common(struct ieee80211_hw *dev)
 		xradio_queue_deinit(&hw_priv->tx_queue[i]);
 	xradio_queue_stats_deinit(&hw_priv->tx_queue_stats);
 
-	for (i = 0; i < XRWL_MAX_VIFS; i++) {
-		kfree(hw_priv->vif_list[i]);
+	/* The vif objects are owned by mac80211, only drop our pointers. */
+	for (i = 0; i < XRWL_MAX_VIFS; i++)
 		hw_priv->vif_list[i] = NULL;
-	}
 
 //fixed memory leakage by yangfh
 #ifdef MCAST_FWDING
@@ -473,7 +480,7 @@ void xradio_free_common(struct ieee80211_hw *dev)
 	ieee80211_free_hw(dev);
 }
 
-int xradio_register_common(struct ieee80211_hw *dev)
+static int xradio_register_common(struct ieee80211_hw *dev)
 {
 	int err = 0;
 	struct xradio_common *hw_priv = dev->priv;
@@ -492,7 +499,7 @@ int xradio_register_common(struct ieee80211_hw *dev)
 	return 0;
 }
 
-void xradio_unregister_common(struct ieee80211_hw *dev)
+static void xradio_unregister_common(struct ieee80211_hw *dev)
 {
 	struct xradio_common *hw_priv = dev->priv;
 

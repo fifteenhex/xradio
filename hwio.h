@@ -179,7 +179,7 @@ static inline int xradio_reg_write_16(struct xradio_common *hw_priv,
 static inline int xradio_reg_read_32(struct xradio_common *hw_priv,
                                       u16 addr, u32 *val)
 {
-	return xradio_reg_read(hw_priv, addr, val, sizeof(val));
+	return xradio_reg_read(hw_priv, addr, val, sizeof(*val));
 }
 
 static inline int xradio_reg_write_32(struct xradio_common *hw_priv,
@@ -205,7 +205,7 @@ static inline int xradio_ahb_read(struct xradio_common *hw_priv, u32 addr,
 static inline int xradio_apb_read_32(struct xradio_common *hw_priv,
                                       u32 addr, u32 *val)
 {
-	return xradio_apb_read(hw_priv, addr, val, sizeof(val));
+	return xradio_apb_read(hw_priv, addr, val, sizeof(*val));
 }
 
 static inline int xradio_apb_write_32(struct xradio_common *hw_priv,
@@ -217,7 +217,7 @@ static inline int xradio_apb_write_32(struct xradio_common *hw_priv,
 static inline int xradio_ahb_read_32(struct xradio_common *hw_priv,
                                       u32 addr, u32 *val)
 {
-	return xradio_ahb_read(hw_priv, addr, val, sizeof(val));
+	return xradio_ahb_read(hw_priv, addr, val, sizeof(*val));
 }
 
 static inline int xradio_ahb_write_32(struct xradio_common *hw_priv,

@@ -1071,7 +1071,6 @@ static int wsm_request_buffer_confirm(struct xradio_vif *priv,
 
 	if (change_mask) {
 		struct ieee80211_sta *sta;
-		int ret = 0;
 
 
 		for (i = 0; i < MAX_STA_IN_AP_MODE ; ++i) {
@@ -1090,9 +1089,11 @@ static int wsm_request_buffer_confirm(struct xradio_vif *priv,
 					wsm_printk(XRADIO_DBG_MSG, "WRBC - could not find sta %pM\n",
 							priv->link_id_db[i].mac);
 				} else {
-					ret = ieee80211_sta_ps_transition_ni(sta, (sta_asleep_mask & mask) ? true: false);
-					wsm_printk(XRADIO_DBG_MSG, "PS State NOTIFIED %d\n", ret);
-					WARN_ON(ret);
+					/* The transition helper returns void, the
+					 * firmware state was already applied above. */
+					ieee80211_sta_ps_transition_ni(sta,
+						(sta_asleep_mask & mask) ? true : false);
+					wsm_printk(XRADIO_DBG_MSG, "PS State NOTIFIED\n");
 				}
 				rcu_read_unlock();			
 			}
@@ -1373,7 +1374,17 @@ static int wsm_receive_indication(struct xradio_common *hw_priv,
 		//remove wsm hdr of skb
 		hdr_len = buf->data - buf->begin;
 		skb_pull(*skb_p, hdr_len);
-		
+
+		/* The frame must still hold an 802.11 header.  Do not ask for
+		 * the larger struct ieee80211_hdr here: a null data frame is
+		 * only 24 bytes long and a power save poll, which the driver
+		 * handles itself, is 16.  That is the size xradio_rx_cb()
+		 * uses as well. */
+		if ((*skb_p)->len < sizeof(struct ieee80211_pspoll)) {
+			spin_unlock(&priv->vif_lock);
+			return 0;
+		}
+
 		/* FW Workaround: Drop probe resp or
 		beacon when RSSI is 0 */
 		hdr = (struct ieee80211_hdr *) (*skb_p)->data;
@@ -1434,6 +1445,7 @@ static int wsm_event_indication(struct xradio_common *hw_priv,
 
 	if (unlikely(priv->mode == NL80211_IFTYPE_UNSPECIFIED)) {
 		/* STA is stopped. */
+		spin_unlock(&priv->vif_lock);
 		return 0;
 	}
 	spin_unlock(&priv->vif_lock);
@@ -1947,7 +1959,9 @@ void wsm_unlock_tx(struct xradio_common *hw_priv)
 	else {
 		tx_lock = atomic_sub_return(1, &hw_priv->tx_lock);
 		if (tx_lock < 0) {
-			BUG_ON(1);
+			/* Unbalanced unlock.  Recover instead of panicking. */
+			atomic_set(&hw_priv->tx_lock, 0);
+			dev_err(hw_priv->pdev, "TX unlock underflow\n");
 		} else if (tx_lock == 0) {
 			xradio_bh_wakeup(hw_priv);
 			wsm_printk(XRADIO_DBG_MSG, "TX is unlocked.\n");
@@ -2011,12 +2025,13 @@ int wsm_handle_exception(struct xradio_common *hw_priv, u8 *data, size_t len)
 		           i + 0, reg[i + 0], i + 1, reg[i + 1],
 		           i + 2, reg[i + 2], i + 3, reg[i + 3]);
 	}
+	/* The register dump has a fixed layout, so index it with constants
+	 * rather than relying on the loop counter's final value. */
 	dev_err(hw_priv->pdev, "Firmware:" \
 	           "R12: 0x%.8X, SP: 0x%.8X, LR: 0x%.8X, PC: 0x%.8X,\n",
-	           reg[i + 0], reg[i + 1], reg[i + 2], reg[i + 3]);
-	i += 4;
+	           reg[12], reg[13], reg[14], reg[15]);
 	dev_err(hw_priv->pdev, "Firmware:CPSR: 0x%.8X, SPSR: 0x%.8X\n",
-	           reg[i + 0], reg[i + 1]);
+	           reg[16], reg[17]);
 	
 	return 0;
 
@@ -2257,7 +2272,10 @@ int wsm_handle_rx(struct xradio_common *hw_priv, int id,
 					id & ~0x0400);
 			break;
 		default:
-			BUG_ON(1);
+			wsm_printk(XRADIO_DBG_ERROR,
+				   "unknown confirm ID=0x%04X.\n", id);
+			ret = -EINVAL;
+			break;
 		}
 
 		spin_lock(&hw_priv->wsm_cmd.lock);
@@ -2457,7 +2475,7 @@ static bool wsm_handle_tx_data(struct xradio_vif *priv,
 	if (action == doTx) {
 		if (unlikely(ieee80211_is_probe_req(fctl))) {
 			action = doProbe;
-		} else if ((fctl & __cpu_to_le32(IEEE80211_FCTL_PROTECTED)) &&
+		} else if ((fctl & cpu_to_le16(IEEE80211_FCTL_PROTECTED)) &&
 			tx_info->control.hw_key &&
 			unlikely(tx_info->control.hw_key->keyidx !=
 					priv->wep_default_key_id) &&
@@ -2490,8 +2508,9 @@ static bool wsm_handle_tx_data(struct xradio_vif *priv,
 		/* See detailed description of "join" below.
 		 * We are dropping everything except AUTH in non-joined mode. */
 		wsm_printk(XRADIO_DBG_MSG, "Drop frame (0x%.4X).\n", fctl);
-		BUG_ON(xradio_queue_remove(queue,
-			__le32_to_cpu(wsm->packetID)));
+		/* The frame may already have been removed (for example after a
+		 * requeue race).  Dropping it twice is not worth a panic. */
+		xradio_queue_remove(queue, __le32_to_cpu(wsm->packetID));
 		handled = true;
 	}
 	break;
@@ -2699,7 +2718,12 @@ int wsm_get_tx(struct xradio_common *hw_priv, u8 **data,
 	if (hw_priv->wsm_cmd.ptr) {
 		++count;
 		spin_lock(&hw_priv->wsm_cmd.lock);
-		BUG_ON(!hw_priv->wsm_cmd.ptr);
+		if (unlikely(!hw_priv->wsm_cmd.ptr)) {
+			/* The command timed out and was dropped while we were
+			 * looking at it.  There is nothing left to send. */
+			spin_unlock(&hw_priv->wsm_cmd.lock);
+			return 0;
+		}
 		*data = hw_priv->wsm_cmd.ptr;
 		*tx_len = hw_priv->wsm_cmd.len;
 		*burst = 1;
@@ -2794,8 +2818,14 @@ int wsm_get_tx(struct xradio_common *hw_priv, u8 **data,
 					tx_allowed_mask,
 					&wsm, &tx_info, &txpriv)) {
 				spin_unlock(&priv->vif_lock);
-				if_pending = 0;
-				continue;
+				/* Try the other interface once, then give up.
+				 * Continuing without the check made this loop
+				 * spin forever when no frame was pending. */
+				if (if_pending) {
+					if_pending = 0;
+					continue;
+				}
+				break;
 			}
 /*
 #ifdef ROC_DEBUG
@@ -2891,7 +2921,8 @@ int wsm_get_tx(struct xradio_common *hw_priv, u8 **data,
 				struct ieee80211_hdr *hdr =
 					(struct ieee80211_hdr *)
 					&((u8 *)wsm)[txpriv->offset];
-				if(strstr(&priv->ssid[0], "6.1.12")) {
+				if (strnstr((char *)&priv->ssid[0], "6.1.12",
+					    priv->ssid_length)) {
 					if(hdr->addr1[0] & 0x01 ) {
 						hdr->frame_control |=
 						cpu_to_le16(IEEE80211_FCTL_MOREDATA);
@@ -2958,22 +2989,22 @@ static int wsm_buf_reserve(struct wsm_buf *buf, size_t extra_size)
 {
 	size_t pos = buf->data - buf->begin;
 	size_t size = pos + extra_size;
+	void *new_begin;
 
+	/* Round the new size up to a whole SDIO block.  SDIO_BLOCK_SIZE is
+	 * 528, which is not a power of two, so the usual masking arithmetic
+	 * does not work here.  The old code could round the size down below
+	 * the data already stored in the buffer, which corrupted the heap. */
+	size = (size + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE * SDIO_BLOCK_SIZE;
 
-	if (size & (SDIO_BLOCK_SIZE - 1)) {
-		size &= SDIO_BLOCK_SIZE;
-		size += SDIO_BLOCK_SIZE;
-	}
-
-	buf->begin = krealloc(buf->begin, size, GFP_KERNEL);
-	if (buf->begin) {
-		buf->data = &buf->begin[pos];
-		buf->end = &buf->begin[size];
-		return 0;
-	} else {
-		buf->end = buf->data = buf->begin;
+	new_begin = krealloc(buf->begin, size, GFP_KERNEL);
+	if (!new_begin)
 		return -ENOMEM;
-	}
+
+	buf->begin = new_begin;
+	buf->data = &buf->begin[pos];
+	buf->end = &buf->begin[size];
+	return 0;
 }
 
 static struct xradio_vif 

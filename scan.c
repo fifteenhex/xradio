@@ -26,10 +26,16 @@ static void xradio_remove_wps_p2p_ie(struct wsm_template_frame *frame)
 	u32 wps_ie_len = 0;
 
 
+	if (frame->skb->len < sizeof(struct ieee80211_hdr_3addr))
+		return;
+
 	ies = &frame->skb->data[sizeof(struct ieee80211_hdr_3addr)];
 	ies_len = frame->skb->len - sizeof(struct ieee80211_hdr_3addr);
 	while (ies_len >= 6) {
 		ie_len = ies[1] + 2;
+		/* A length byte can claim more than the frame holds. */
+		if (ie_len > ies_len)
+			break;
 		ies_len -= ie_len;
 		if ((ies[0] == WLAN_EID_VENDOR_SPECIFIC) && 
 			  (ies[2] == 0x00 && ies[3] == 0x50 && 
@@ -47,7 +53,9 @@ static void xradio_remove_wps_p2p_ie(struct wsm_template_frame *frame)
 	}
 
 	if (p2p_ie_len || wps_ie_len) {
-		skb_trim(frame->skb, frame->skb->len - (p2p_ie_len + wps_ie_len));
+		if (p2p_ie_len + wps_ie_len <= frame->skb->len)
+			skb_trim(frame->skb,
+				 frame->skb->len - (p2p_ie_len + wps_ie_len));
 	}
 }
 
@@ -274,7 +282,7 @@ int xradio_hw_sched_scan_start(struct ieee80211_hw *hw,
 	scan_printk(XRADIO_DBG_NIY, "[SCAN] Scan request for %d SSIDs.\n", 
 	            req->n_ssids);
 
-	if (req->n_ssids > hw->wiphy->max_scan_ssids) [
+	if (req->n_ssids > hw->wiphy->max_scan_ssids) {
 		scan_printk(XRADIO_DBG_ERROR, "%s: ssids is too much(%d)\n", 
 		            __func__, req->n_ssids);
 		return -EINVAL;
@@ -367,6 +375,17 @@ void xradio_scan_work(struct work_struct *work)
 	if (!priv) {
 		scan_printk(XRADIO_DBG_WARN, "interface removed, "
 		            "ignoring scan work\n");
+		/* The scan lock and the TX lock were taken when the scan was
+		 * started.  They must be released or the next scan or flush
+		 * blocks forever.  mac80211 is also still waiting for this scan
+		 * to finish and keeps its state until the driver reports it, so
+		 * report it as aborted. */
+		hw_priv->scan.req = NULL;
+		wsm_unlock_tx(hw_priv);
+		memset(&scan_info, 0, sizeof(scan_info));
+		scan_info.aborted = true;
+		ieee80211_scan_completed(hw_priv->hw, &scan_info);
+		up(&hw_priv->scan.lock);
 		return;
 	}
 
@@ -815,6 +834,7 @@ void xradio_probe_work(struct work_struct *work)
 	if (!priv) {
 		up(&hw_priv->scan.lock);
 		mutex_unlock(&hw_priv->conf_mutex);
+		wsm_unlock_tx(hw_priv);
 		scan_printk(XRADIO_DBG_ERROR, "%s:priv error!\n", __func__);
 		return;
 	}
@@ -847,7 +867,8 @@ void xradio_probe_work(struct work_struct *work)
 
 	if (ies_len) {
 		u8 *ssidie = (u8 *)cfg80211_find_ie(WLAN_EID_SSID, ies, ies_len);
-		if (ssidie && ssidie[1] && ssidie[1] <= sizeof(ssids[0].ssid)) {
+		if (ssidie && ssidie[1] && ssidie[1] <= sizeof(ssids[0].ssid) &&
+		    ssidie + 2 + ssidie[1] <= &ies[ies_len]) {
 			u8 *nextie = &ssidie[2 + ssidie[1]];
 			/* Remove SSID from the IE list. It has to be provided
 			 * as a separate argument in xradio_scan_start call */
@@ -887,7 +908,7 @@ void xradio_probe_work(struct work_struct *work)
 	if (!ret)
 		IEEE80211_SKB_CB(frame.skb)->flags |= IEEE80211_TX_STAT_ACK;
 
-	BUG_ON(xradio_queue_remove(queue, hw_priv->pending_frame_id));
+	xradio_queue_remove(queue, hw_priv->pending_frame_id);
 
 	if (ret) {
 		hw_priv->scan.direct_probe = 0;

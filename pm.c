@@ -171,7 +171,7 @@ static int xradio_pm_init_common(struct xradio_pm_state *pm,
 		pm_printk(XRADIO_DBG_ERROR, "%s:platform_device_add failed(%d)!\n",
 		           __FUNCTION__, ret);
 		platform_driver_unregister(&xradio_power_driver);
-		kfree(pm->pm_dev);
+		platform_device_put(pm->pm_dev);
 		pm->pm_dev = NULL;
 	}
 
@@ -458,7 +458,10 @@ int xradio_wow_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan)
 #ifdef CONFIG_XRADIO_SUSPEND_POWER_OFF
 //	if (STANDBY_WITH_POWER_OFF == standby_level) {
 	if (1) {
-		return xradio_poweroff_suspend(hw_priv);
+		ret = xradio_poweroff_suspend(hw_priv);
+		if (ret)
+			goto revert3;
+		return 0;
 	}
 #endif
 	
@@ -653,13 +656,18 @@ int xradio_wow_resume(struct ieee80211_hw *hw)
 
 
 	WARN_ON(!atomic_read(&hw_priv->num_vifs));
-	if(hw_priv->bh_error) return 0;
 
 #ifdef CONFIG_XRADIO_SUSPEND_POWER_OFF
 	if (XRADIO_POWEROFF_SUSP == atomic_read(&hw_priv->suspend_state)) {
 		return xradio_poweroff_resume(hw_priv);
 	}
 #endif
+
+	/* Resume must always release what suspend took.  If the device died
+	 * while suspended do not return early or the configuration mutex and
+	 * the scan lock stay held forever. */
+	if (hw_priv->bh_error)
+		wiphy_warn(hw->wiphy, "resuming with a dead device\n");
 
 	/* Disable IRQ wake */
 	sdio_pm(hw_priv, false);
@@ -704,6 +712,12 @@ static int __xradio_wow_resume(struct xradio_vif *priv)
 	/* Restore suspend state */
 	state = pm_state_vif->suspend_state;
 	pm_state_vif->suspend_state = NULL;
+
+	/* Nothing was stored for this interface.  This happens when
+	 * __xradio_wow_suspend() failed for it and the caller rolls the
+	 * already suspended interfaces back, so there is nothing to undo. */
+	if (!state)
+		return 0;
 
 #ifdef ROAM_OFFLOAD
 	if((priv->vif->type == NL80211_IFTYPE_STATION)
@@ -784,6 +798,13 @@ static int xradio_poweroff_suspend(struct xradio_common *hw_priv)
 	/* Stop serving thread */
 	if (xradio_bh_suspend(hw_priv)) {
 		pm_printk(XRADIO_DBG_WARN, "%s, xradio_bh_suspend failed!\n", __func__);
+		/* The thread parks itself even if the wait for it timed out,
+		 * and mac80211 does not call the resume callback after a failed
+		 * suspend, so wake it up again here.  Otherwise the data path
+		 * stays dead until the next resume. */
+		if (!hw_priv->bh_error)
+			WARN_ON(xradio_bh_resume(hw_priv));
+		atomic_set(&hw_priv->suspend_state, XRADIO_RESUME);
 		return -EBUSY;
 	}
 

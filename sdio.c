@@ -165,6 +165,8 @@ static int xradio_probe_of(struct sdio_func *func)
 static int sdio_probe(struct sdio_func *func,
                       const struct sdio_device_id *id)
 {
+	int ret;
+
 	dev_dbg(&func->dev, "XRadio Device:sdio clk=%d\n",
 	            func->card->host->ios.clock);
 	dev_dbg(&func->dev, "sdio func->class=%x\n", func->class);
@@ -185,18 +187,40 @@ static int sdio_probe(struct sdio_func *func,
 }
 #endif
 
-	xradio_probe_of(func);
+	ret = xradio_probe_of(func);
+	if (ret) {
+		dev_err(&func->dev, "failed to request IRQ: %d\n", ret);
+		return ret;
+	}
 
 	func->card->quirks |= MMC_QUIRK_BROKEN_BYTE_MODE_512;
 	sdio_claim_host(func);
-	sdio_enable_func(func);
+	ret = sdio_enable_func(func);
 	sdio_release_host(func);
+	if (ret) {
+		dev_err(&func->dev, "failed to enable SDIO function: %d\n", ret);
+		return ret;
+	}
 
-	sdio_enableint(func);
+	ret = sdio_enableint(func);
+	if (ret) {
+		dev_err(&func->dev, "failed to enable SDIO interrupts: %d\n", ret);
+		goto err_disable;
+	}
 
-	xradio_core_init(func);
+	ret = xradio_core_init(func);
+	if (ret) {
+		dev_err(&func->dev, "failed to initialise driver: %d\n", ret);
+		goto err_disable;
+	}
 
 	return 0;
+
+err_disable:
+	sdio_claim_host(func);
+	sdio_disable_func(func);
+	sdio_release_host(func);
+	return ret;
 }
 /* Disconnect Function to be called by SDIO stack when
  * device is disconnected */

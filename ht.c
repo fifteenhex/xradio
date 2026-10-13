@@ -61,17 +61,22 @@ void xradio_remove_ht_ie(struct xradio_vif *priv, struct sk_buff *skb)
 	else
 		return;
 
+	/* The fixed part of the frame may be longer than the skb. */
+	if ((u8 *)ies > skb->data + skb->len)
+		return;
+
 	ies_len = skb->len - (ies - (u8 *)(skb->data));
 	ht_ie   = (u8 *)xradio_get_ie(ies, ies_len, WLAN_EID_HT_CAPABILITY);
 	if (ht_ie) {
-		u8 ht_len   = *(ht_ie + 1) + 2;
-		u8 move_len = (ies + ies_len) - (ht_ie + ht_len);
+		size_t ht_len   = ht_ie[1] + 2;
+		size_t move_len = (ies + ies_len) - (ht_ie + ht_len);
+
 		memmove(ht_ie, (ht_ie + ht_len), move_len);
 		skb_trim(skb, skb->len - ht_len);
 		ies_len = skb->len - (ies - (u8 *)(skb->data));
 		ht_ie = (u8 *)xradio_get_ie(ies, ies_len, WLAN_EID_HT_OPERATION);
 		if (ht_ie) {
-			ht_len   = *(ht_ie + 1) + 2;
+			ht_len   = ht_ie[1] + 2;
 			move_len = (ies + ies_len) - (ht_ie + ht_len);
 			memmove(ht_ie, (ht_ie + ht_len), move_len);
 			skb_trim(skb, skb->len - ht_len);

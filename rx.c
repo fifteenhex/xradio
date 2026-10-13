@@ -130,8 +130,9 @@ void xradio_rx_cb(struct xradio_vif *priv,
 #endif
 
 #if defined(CONFIG_XRADIO_USE_EXTENSIONS)
-	if ((ieee80211_is_action(frame->frame_control))
-	    && (mgmt->u.action.category == WLAN_CATEGORY_PUBLIC)) {
+	if (skb->len >= 24 + 18 &&
+	    ieee80211_is_action(frame->frame_control) &&
+	    mgmt->u.action.category == WLAN_CATEGORY_PUBLIC) {
 		u8 *action = (u8*)&mgmt->u.action.category;
 		xradio_check_go_neg_conf_success(hw_priv, action);
 	}
@@ -217,7 +218,10 @@ void xradio_rx_cb(struct xradio_vif *priv,
        
 	if (arg->rxedRate >= 14) {
 		hdr->flag |= RX_ENC_HT;
-		hdr->rate_idx = arg->rxedRate - 14;
+		/* The radio has a single spatial stream, so only the first
+		 * eight MCS values exist.  A larger value is a firmware error
+		 * and mac80211 drops such a frame with a warning. */
+		hdr->rate_idx = min_t(u8, arg->rxedRate - 14, 7);
 	} else if (arg->rxedRate >= 4) {
 		if (hdr->band == NL80211_BAND_5GHZ)
 			hdr->rate_idx = arg->rxedRate - 6;
@@ -296,7 +300,10 @@ void xradio_rx_cb(struct xradio_vif *priv,
 
 	if (ieee80211_is_beacon(frame->frame_control) &&
 		!arg->status &&
-		!memcmp(ieee80211_get_SA(frame), priv->join_bssid,ETH_ALEN)) {
+		!memcmp(ieee80211_get_SA(frame), priv->join_bssid,ETH_ALEN) &&
+		/* The fixed part must fit, otherwise the IE length below
+		 * underflows. */
+		skb->len >= offsetof(struct ieee80211_mgmt, u.beacon.variable)) {
 		const u8 *tim_ie;
 		u8 *ies;
 		size_t ies_len;
@@ -327,7 +334,8 @@ void xradio_rx_cb(struct xradio_vif *priv,
     if (priv->mode == NL80211_IFTYPE_AP           &&
         ieee80211_is_beacon(frame->frame_control) &&
         ((priv->ht_oper&HT_INFO_MASK) != 0x0011)  &&
-        !arg->status){
+        !arg->status &&
+        skb->len >= offsetof(struct ieee80211_mgmt, u.beacon.variable)){
         u8 *ies;
         size_t ies_len;
         const u8 *ht_cap;

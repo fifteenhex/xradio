@@ -208,7 +208,7 @@ static int xradio_set_tim_impl(struct xradio_vif *priv, bool aid0_bit_set)
 		.what = WSM_UPDATE_IE_BEACON,
 		.count = 1,
 	};
-	u16 tim_offset, tim_length;
+	u16 tim_offset, tim_length, cmp_len;
 	ap_printk(XRADIO_DBG_TRC,"%s\n", __FUNCTION__);
 	ap_printk(XRADIO_DBG_MSG, "%s mcast: %s.\n", __func__, 
 	          aid0_bit_set ? "ena" : "dis");
@@ -237,10 +237,15 @@ static int xradio_set_tim_impl(struct xradio_vif *priv, bool aid0_bit_set)
 
 	update_ie.ies = &skb->data[tim_offset];
 	update_ie.length = tim_length;
+	/* tim_length covers the TIM element and the IEs that follow it, so it
+	 * can be larger than the room kept for the last copy.  Only the first
+	 * bytes are remembered and compared. */
+	cmp_len = min_t(u16, tim_length, sizeof(priv->last_tim));
 	//filter same tim info, yangfh
-	if(memcmp(priv->last_tim, update_ie.ies, tim_length)) {
+	if (tim_length > sizeof(priv->last_tim) ||
+	    memcmp(priv->last_tim, update_ie.ies, cmp_len)) {
 		WARN_ON(wsm_update_ie(hw_priv, &update_ie, priv->if_id));
-		memcpy(priv->last_tim, update_ie.ies, tim_length);
+		memcpy(priv->last_tim, update_ie.ies, cmp_len);
 		ap_printk(XRADIO_DBG_MSG,"%02x %02x %02x %02x %02x %02x\n", 
 		          update_ie.ies[0], update_ie.ies[1], update_ie.ies[2], 
 		          update_ie.ies[3], update_ie.ies[4], update_ie.ies[5]);
@@ -485,12 +490,15 @@ void xradio_bss_info_changed(struct ieee80211_hw *dev,
 				BUG_ON(!hw_priv->channel);
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
 				hw_priv->ht_oper.ht_cap = sta->deflink.ht_cap;
-				priv->bss_params.operationalRateSet =__cpu_to_le32(
-				  xradio_rate_mask_to_wsm(hw_priv, sta->deflink.supp_rates[hw_priv->channel->band]));
+				/* operationalRateSet is a plain CPU endian u32 (see the
+				 * -1 and ~0xF uses above), so it must not be converted
+				 * here; wsm_set_bss_params() converts on the wire. */
+				priv->bss_params.operationalRateSet =
+				  xradio_rate_mask_to_wsm(hw_priv, sta->deflink.supp_rates[hw_priv->channel->band]);
 #else
 				hw_priv->ht_oper.ht_cap = sta->ht_cap;
-				priv->bss_params.operationalRateSet =__cpu_to_le32(
-				  xradio_rate_mask_to_wsm(hw_priv, sta->supp_rates[hw_priv->channel->band]));
+				priv->bss_params.operationalRateSet =
+				  xradio_rate_mask_to_wsm(hw_priv, sta->supp_rates[hw_priv->channel->band]);
 #endif
 				/* TODO by Icenowy: I think this may lead to some problems. */
 //				hw_priv->ht_oper.channel_type   = info->channel_type;
@@ -989,6 +997,12 @@ static int xradio_upload_beacon(struct xradio_vif *priv)
 		return -ENOMEM;
 
 	mgmt = (void *)frame.skb->data;
+	/* The fixed part has to be present before the IE length below can
+	 * be derived, or it underflows. */
+	if (frame.skb->len < offsetof(struct ieee80211_mgmt, u.beacon.variable)) {
+		dev_kfree_skb(frame.skb);
+		return -1;
+	}
 	ies  = mgmt->u.beacon.variable;
 	ies_len = frame.skb->len - (u32)(ies - (u8 *)mgmt);
 
@@ -1023,7 +1037,10 @@ static int xradio_upload_beacon(struct xradio_vif *priv)
 
 		ap_printk(XRADIO_DBG_NIY, "%s: hidden_ssid set\n", __func__);
 		ssid_ie = (u8 *)cfg80211_find_ie(WLAN_EID_SSID, ies, ies_len);
-		WARN_ON(!ssid_ie);
+		if (WARN_ON(!ssid_ie)) {
+			dev_kfree_skb(frame.skb);
+			return -1;
+		}
 		ssid_len = ssid_ie[1];
 		if (ssid_len) {
 			ap_printk(XRADIO_DBG_MSG, "hidden_ssid with zero content ssid\n");
@@ -1097,8 +1114,18 @@ static int xradio_upload_proberesp(struct xradio_vif *priv)
 		  */
 
 		offset  = offsetof(struct ieee80211_mgmt, u.probe_resp.variable);
+		if (frame.skb->len <= offset) {
+			dev_kfree_skb(frame.skb);
+			return -1;
+		}
 		ssid_ie = (u8 *)cfg80211_find_ie(WLAN_EID_SSID, frame.skb->data + offset,
 		                           frame.skb->len - offset);
+		if (!ssid_ie) {
+			ap_printk(XRADIO_DBG_ERROR, "%s: probe response without ssid\n",
+			         __func__);
+			dev_kfree_skb(frame.skb);
+			return -1;
+		}
 		ssid_len = ssid_ie[1];
 		if (ssid_len && (ssid_len == priv->ssid_length)) {
 			memcpy(ssid_ie + 2, priv->ssid, ssid_len);
@@ -1168,8 +1195,10 @@ static int xradio_upload_qosnull(struct xradio_vif *priv)
 		.frame_type = WSM_FRAME_TYPE_QOS_NULL,
 		.rate = 0xFF,
 	};
-	if (!hw_priv) 
+	if (!hw_priv) {
 		ap_printk(XRADIO_DBG_ERROR,"%s: Cannot find xradio_common pointer!\n",__FUNCTION__);
+		return -1;
+	}
 	/*set qos template*/
 	skb = dev_alloc_skb(hw_priv->hw->extra_tx_headroom + sizeof(struct ieee80211_qos_hdr));
 	if (!skb) {
@@ -1271,6 +1300,11 @@ static int xradio_start_ap(struct xradio_vif *priv)
 	}
 
 	offset = offsetof(struct ieee80211_mgmt, u.beacon.variable);
+	if (skb->len < offset) {
+		ap_printk(XRADIO_DBG_ERROR, "%s, short beacon\n", __func__);
+		dev_kfree_skb(skb);
+		return -1;
+	}
 	ssidie = cfg80211_find_ie(WLAN_EID_SSID, skb->data + offset, skb->len - offset);
 
 	memset(priv->ssid, 0, sizeof(priv->ssid));
@@ -1311,7 +1345,7 @@ static int xradio_start_ap(struct xradio_vif *priv)
 	}
 
 	/*Set Inactivity time*/
-	if(!(strstr(&start.ssid[0], "6.1.12"))) {
+	if (!strnstr((char *)&start.ssid[0], "6.1.12", start.ssidLength)) {
 		wsm_set_inactivity(hw_priv, &inactivity, priv->if_id);
 	}
 	if (!ret) {
@@ -1396,7 +1430,7 @@ int xradio_alloc_link_id(struct xradio_vif *priv, const u8 *mac)
 			ret = i + 1;
 			break;
 		} else if (priv->link_id_db[i].status != XRADIO_LINK_HARD &&
-		           !hw_priv->tx_queue_stats.link_map_cache[i + 1]) {
+		           !hw_priv->tx_queue_stats.link_map_cache[priv->if_id][i + 1]) {
 			unsigned long inactivity = now - priv->link_id_db[i].timestamp;
 			if (inactivity < max_inactivity)
 				continue;
@@ -1598,6 +1632,10 @@ void xradio_ht_oper_update_work(struct work_struct *work)
 	if (WARN_ON(!skb))
 		return;
 
+	if (skb->len < offsetof(struct ieee80211_mgmt, u.beacon.variable)) {
+		dev_kfree_skb(skb);
+		return;
+	}
 	mgmt = (void *)skb->data;
 	ies = mgmt->u.beacon.variable;
 	ies_len = skb->len - (u32)(ies - (u8 *)mgmt);

@@ -112,19 +112,59 @@ static int xradio_parse_sdd(struct xradio_common *hw_priv, u32 *dpll)
 
 	//parse SDD config.
 	hw_priv->is_BT_Present = false;
+
+	if (hw_priv->sdd->size < FIELD_OFFSET(struct xradio_sdd, data)) {
+		dev_warn(hw_priv->pdev, "SDD image is too short (%zu bytes)\n",
+			 hw_priv->sdd->size);
+		goto bad_sdd;
+	}
+
 	pElement = (struct xradio_sdd *)hw_priv->sdd->data;
-	parsedLength += (FIELD_OFFSET(struct xradio_sdd, data) + pElement->length);
+
+	/* The first element is a header that carries no configuration, the
+	 * vendor driver skips it before it starts looking at the elements it
+	 * understands.  Keep doing that, otherwise its payload is parsed as
+	 * an element and the rest of the image is decoded at the wrong
+	 * offset. */
+	if ((size_t)FIELD_OFFSET(struct xradio_sdd, data) + pElement->length >
+	    hw_priv->sdd->size) {
+		dev_warn(hw_priv->pdev, "truncated SDD header element len=%d\n",
+			 pElement->length);
+		goto bad_sdd;
+	}
+	parsedLength += FIELD_OFFSET(struct xradio_sdd, data) + pElement->length;
 	pElement = FIND_NEXT_ELT(pElement);
 
 	while (parsedLength < hw_priv->sdd->size) {
+		size_t elt_size;
+
+		/* Need at least the id and length bytes before the element
+		 * header can be read. */
+		if (parsedLength + FIELD_OFFSET(struct xradio_sdd, data) >
+		    hw_priv->sdd->size)
+			break;
+
+		elt_size = FIELD_OFFSET(struct xradio_sdd, data) +
+			   pElement->length;
+		if (parsedLength + elt_size > hw_priv->sdd->size) {
+			dev_warn(hw_priv->pdev,
+				 "truncated SDD element id=%d len=%d\n",
+				 pElement->id, pElement->length);
+			break;
+		}
+
 		switch (pElement->id) {
 		case SDD_PTA_CFG_ELT_ID:
+			if (pElement->length < 4)
+				break;
 			hw_priv->conf_listen_interval = (*((u16 *)pElement->data+1) >> 7) & 0x1F;
 			hw_priv->is_BT_Present = true;
 			xradio_dbg(XRADIO_DBG_NIY, "PTA element found.Listen Interval %d\n",
 			           hw_priv->conf_listen_interval);
 			break;
 		case SDD_REFERENCE_FREQUENCY_ELT_ID:
+			if (pElement->length < 2)
+				break;
 			switch(*((uint16_t*)pElement->data)) {
 			case 0x32C8:
 				*dpll = 0x1D89D241;
@@ -168,7 +208,7 @@ static int xradio_parse_sdd(struct xradio_common *hw_priv, u32 *dpll)
 		default:
 			break;
 		}
-		parsedLength += (FIELD_OFFSET(struct xradio_sdd, data) + pElement->length);
+		parsedLength += elt_size;
 		pElement = FIND_NEXT_ELT(pElement);
 	}
 	
@@ -181,6 +221,13 @@ static int xradio_parse_sdd(struct xradio_common *hw_priv, u32 *dpll)
 		xradio_dbg(XRADIO_DBG_NIY, "PTA element NOT found.\n");
 	}
 	return ret;
+
+bad_sdd:
+	/* The image cannot be decoded, so do not leave it for a probe that
+	 * is about to fail. */
+	release_firmware(hw_priv->sdd);
+	hw_priv->sdd = NULL;
+	return -EINVAL;
 }
 
 static int xradio_firmware(struct xradio_common *hw_priv)
@@ -225,7 +272,11 @@ static int xradio_firmware(struct xradio_common *hw_priv)
 				fw_path);
 		goto error;
 	}
-	BUG_ON(!firmware->data);
+	if (!firmware->data || !firmware->size) {
+		dev_err(hw_priv->pdev, "firmware file %s is empty.\n", fw_path);
+		ret = -EINVAL;
+		goto error;
+	}
 
 	buf = kmalloc(DOWNLOAD_BLOCK_SIZE, GFP_KERNEL);
 	if (!buf) {
@@ -337,7 +388,7 @@ static int xradio_bootloader(struct xradio_common *hw_priv)
 	int ret;
 	u32 i;
 	u32 *data;
-	const struct firmware *bootloader;
+	const struct firmware *bootloader = NULL;
 
 	/* Load a bootloader file */
 	ret = request_firmware(&bootloader, bl_path, hw_priv->pdev);

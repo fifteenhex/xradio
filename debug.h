@@ -11,12 +11,16 @@
 #ifndef XRADIO_DEBUG_H_INCLUDED
 #define XRADIO_DEBUG_H_INCLUDED
 
-#define xradio_dbg(level, ...)
-#define txrx_printk(level, ...)
-#define wsm_printk(level, ...)
-#define sta_printk(level, ...)
-#define scan_printk(level, ...)
-#define ap_printk(level, ...)
-#define pm_printk(level, ...)
+/* The logging is compiled out of this port.  A macro that expands to
+ * nothing leaves "if (cond) wsm_printk(...);" with an empty body, which
+ * the kernel build warns about, so expand to an empty statement instead.
+ */
+#define xradio_dbg(level, ...)	do { } while (0)
+#define txrx_printk(level, ...)	do { } while (0)
+#define wsm_printk(level, ...)	do { } while (0)
+#define sta_printk(level, ...)	do { } while (0)
+#define scan_printk(level, ...)	do { } while (0)
+#define ap_printk(level, ...)	do { } while (0)
+#define pm_printk(level, ...)	do { } while (0)
 
 #endif /* XRADIO_DEBUG_H_INCLUDED */

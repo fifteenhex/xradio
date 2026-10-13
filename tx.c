@@ -100,8 +100,12 @@ static void tx_policy_build(const struct xradio_common *hw_priv,
 	struct ieee80211_tx_rate tmp_tx_rate;
 	struct ieee80211_rate * tmp_rate = NULL;
 	s32 key_sort_value = 0;
-	BUG_ON(rates[0].idx < 0);
+
 	memset(policy, 0, sizeof(*policy));
+
+	/* A policy without a valid first rate cannot be built. */
+	if (rates[0].idx < 0)
+		return;
 
 
 	txrx_printk(XRADIO_DBG_NIY,"============================");
@@ -543,7 +547,7 @@ xradio_tx_h_crypt(struct xradio_vif *priv,
 
 	if (!t->tx_info->control.hw_key ||
 	    !(t->hdr->frame_control &
-	     __cpu_to_le32(IEEE80211_FCTL_PROTECTED)))
+	     cpu_to_le16(IEEE80211_FCTL_PROTECTED)))
 		return 0;
 
 	iv_len = t->tx_info->control.hw_key->iv_len;
@@ -680,11 +684,12 @@ xradio_tx_h_bt(struct xradio_vif *priv, struct xradio_txinfo *t, struct wsm_tx *
 
 	if (unlikely(ieee80211_is_nullfunc(t->hdr->frame_control)))
 		priority = WSM_EPTA_PRIORITY_MGT;
-	else if (ieee80211_is_data(t->hdr->frame_control)) {
+	else if (ieee80211_is_data(t->hdr->frame_control) &&
+		 t->skb->len >= t->hdrlen + 8) {
 		/* Skip LLC SNAP header (+6) */
 		u8 *payload = &t->skb->data[t->hdrlen];
-		u16 *ethertype = (u16 *) &payload[6];
-		if (unlikely(*ethertype == __be16_to_cpu(ETH_P_PAE)))
+		__be16 *ethertype = (__be16 *) &payload[6];
+		if (unlikely(be16_to_cpu(*ethertype) == ETH_P_PAE))
 			priority = WSM_EPTA_PRIORITY_EAPOL;
 	} else if (unlikely(ieee80211_is_assoc_req(t->hdr->frame_control) ||
 		ieee80211_is_reassoc_req(t->hdr->frame_control))) {
@@ -739,6 +744,8 @@ xradio_tx_h_rate_policy(struct xradio_common *hw_priv, struct xradio_txinfo *t,
 
 	wsm->flags |= t->txpriv.rate_id << 4;
 	t->rate = xradio_get_tx_rate(hw_priv, &t->tx_info->control.rates[0]);
+	if (unlikely(!t->rate))
+		return -EFAULT;
 	if (t->txpriv.use_bg_rate)
 		wsm->maxTxRate = (u8)(t->txpriv.use_bg_rate & 0x3f);
 	else
@@ -855,8 +862,10 @@ void xradio_tx(struct ieee80211_hw *dev, struct ieee80211_tx_control *control, s
 	struct ieee80211_hdr *frame = (struct ieee80211_hdr *)skb->data;
 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
 
-	if (!skb->data)
-		BUG_ON(1);
+	if (!skb->data) {
+		ieee80211_free_txskb(dev, skb);
+		return;
+	}
 
 	if (!(t.tx_info->control.vif)) {
 		ret = __LINE__;
@@ -881,7 +890,7 @@ void xradio_tx(struct ieee80211_hw *dev, struct ieee80211_tx_control *control, s
 		/* since Umac had already alloc IV space in ccmp skb, so we need to add this iv_len as the new offset to LLC */
 		u8* llc = NULL;
 		if(t.tx_info->control.hw_key && 
-		  	(t.hdr->frame_control & __cpu_to_le32(IEEE80211_FCTL_PROTECTED)) &&
+		  	(t.hdr->frame_control & cpu_to_le16(IEEE80211_FCTL_PROTECTED)) &&
 		  		(t.tx_info->control.hw_key->cipher == WLAN_CIPHER_SUITE_CCMP))
 			llc = skb->data+ieee80211_hdrlen(frame->frame_control) + t.tx_info->control.hw_key->iv_len;
 		else
@@ -912,7 +921,8 @@ void xradio_tx(struct ieee80211_hw *dev, struct ieee80211_tx_control *control, s
 	xradio_frame_monitor(hw_priv,skb,true);
 #endif
 
-	if (ieee80211_is_action(frame->frame_control) && 
+	if (skb->len >= 24 + 18 &&
+		ieee80211_is_action(frame->frame_control) &&
 		mgmt->u.action.category == WLAN_CATEGORY_PUBLIC) {
 		u8 *action = (u8*)&mgmt->u.action.category;
 		xradio_check_go_neg_conf_success(hw_priv, action);
@@ -1004,14 +1014,23 @@ void xradio_tx(struct ieee80211_hw *dev, struct ieee80211_tx_control *control, s
 	spin_lock_bh(&priv->ps_state_lock);
 	{
 		tid_update = xradio_tx_h_pm_state(priv, &t);
-		BUG_ON(xradio_queue_put(&hw_priv->tx_queue[t.queue],
-				t.skb, &t.txpriv));
+		ret = xradio_queue_put(&hw_priv->tx_queue[t.queue],
+				t.skb, &t.txpriv);
 #ifdef ROC_DEBUG
 		txrx_printk(XRADIO_DBG_ERROR, "QPUT %x, %pM, if_id - %d\n",
 			t.hdr->frame_control, t.da, priv->if_id);
 #endif
 	}
 	spin_unlock_bh(&priv->ps_state_lock);
+
+	if (unlikely(ret)) {
+		/* The queue has no free slot.  Drop the frame instead of
+		 * taking the kernel down. */
+		dev_warn(hw_priv->pdev, "no free TX queue slot\n");
+		rcu_read_unlock();
+		ret = __LINE__;
+		goto drop;
+	}
 
 #if defined(CONFIG_XRADIO_USE_EXTENSIONS)
 	if (tid_update && sta)

@@ -127,14 +127,29 @@ void xradio_stop(struct ieee80211_hw *dev)
 	struct xradio_vif *priv = NULL;
 	LIST_HEAD(list);
 	int i;
+	unsigned long scan_lock_deadline;
+	bool have_scan_lock = false;
 
 	wsm_lock_tx(hw_priv);
-	while (down_trylock(&hw_priv->scan.lock)) {
+	/* Wait for a running scan to release the lock, but do not hang
+	 * forever when it never does. */
+	scan_lock_deadline = jiffies + 2 * HZ;
+	for (;;) {
+		if (!down_trylock(&hw_priv->scan.lock)) {
+			have_scan_lock = true;
+			break;
+		}
 		/* Scan is in progress. Force it to stop. */
 		hw_priv->scan.req = NULL;
+		if (time_after(jiffies, scan_lock_deadline)) {
+			wiphy_warn(dev->wiphy,
+			           "scan did not stop, continuing without it\n");
+			break;
+		}
 		schedule();
 	}
-	up(&hw_priv->scan.lock);
+	if (have_scan_lock)
+		up(&hw_priv->scan.lock);
 
 	cancel_delayed_work_sync(&hw_priv->scan.probe_work);
 	cancel_delayed_work_sync(&hw_priv->scan.timeout);
@@ -183,7 +198,6 @@ int xradio_add_interface(struct ieee80211_hw *dev,
 	int ret;
 	struct xradio_common *hw_priv = dev->priv;
 	struct xradio_vif *priv;
-	struct xradio_vif **drv_priv = (void *)vif->drv_priv;
 	int i;
 	if (atomic_read(&hw_priv->num_vifs) >= XRWL_MAX_VIFS)
 		return -EOPNOTSUPP;
@@ -201,7 +215,6 @@ int xradio_add_interface(struct ieee80211_hw *dev,
 	priv = xrwl_get_vif_from_ieee80211(vif);
 	atomic_set(&priv->enabled, 0);
 
-	*drv_priv = priv;
 	/* __le32 auto_calibration_mode = __cpu_to_le32(1); */
 
 	mutex_lock(&hw_priv->conf_mutex);
@@ -686,10 +699,10 @@ int xradio_conf_tx(struct ieee80211_hw *dev, struct ieee80211_vif *vif,
 	/* To prevent re-applying PM request OID again and again*/
 	bool old_uapsdFlags;
 
-	wiphy_debug(dev->wiphy, "vif %d, configuring tx\n", priv->if_id);
-
 	if (WARN_ON(!priv))
 		return -EOPNOTSUPP;
+
+	wiphy_debug(dev->wiphy, "vif %d, configuring tx\n", priv->if_id);
 
 	mutex_lock(&hw_priv->conf_mutex);
 
@@ -920,6 +933,7 @@ int xradio_remain_on_channel(struct ieee80211_hw *hw,
 	struct xradio_vif *priv = NULL;
 	int i = 0;
 	int if_id;
+	bool roc_started = false;
 #ifdef	TES_P2P_0002_ROC_RESTART
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0))
 	struct timespec64 TES_P2P_0002_tmval;
@@ -964,16 +978,23 @@ int xradio_remain_on_channel(struct ieee80211_hw *hw,
 			queue_delayed_work(hw_priv->workqueue, &hw_priv->rem_chan_timeout,
 			                   duration * HZ / 1000);
 			priv->join_status = XRADIO_JOIN_STATUS_MONITOR;
+			roc_started = true;
 			ieee80211_ready_on_channel(hw);
 		} else {
 			hw_priv->roc_if_id = -1;
-			up(&hw_priv->scan.lock);
 		}
 
 #ifdef ROC_DEBUG
 		sta_printk(XRADIO_DBG_WARN, "ROC OUT %d\n", priv->if_id);
 #endif
 			}
+		/* The scan lock is released by the remain on channel timeout
+		 * when a channel was entered.  When no interface could enter it
+		 * the lock has to be given back here, otherwise every later scan
+		 * and every stop request waits for it forever. */
+		if (!roc_started)
+			up(&hw_priv->scan.lock);
+
 		/* set the channel to supplied ieee80211_channel pointer, if it
 	        is not set. This is to remove the crash while sending a probe res
 	        in listen state. Later channel will updated on
@@ -1135,6 +1156,12 @@ void xradio_event_handler(struct work_struct *work)
 			        struct ieee80211_mgmt *deauth;
 			        struct xradio_link_entry *entry = NULL;
 
+				if (link_id <= 0 || link_id > MAX_STA_IN_AP_MODE) {
+					sta_printk(XRADIO_DBG_WARN,
+						   "Inactivity event with bad link_id %d\n",
+						   link_id);
+					break;
+				}
 				sta_printk(XRADIO_DBG_WARN, "Inactivity Event Recieved for "
 						"link_id %d\n", link_id);
 				skb = dev_alloc_skb(sizeof(struct ieee80211_mgmt) + 64);
@@ -1290,7 +1317,7 @@ int xradio_setup_mac(struct xradio_common *hw_priv)
 	return ret;
 }
 
-void xradio_pending_offchanneltx_work(struct work_struct *work)
+static void xradio_pending_offchanneltx_work(struct work_struct *work)
 {
 	struct xradio_vif *priv =
 	container_of(work, struct xradio_vif, pending_offchanneltx_work.work);
@@ -1330,11 +1357,11 @@ void xradio_offchannel_work(struct work_struct *work)
 			sta_printk(XRADIO_DBG_ERROR, "xradio_offchannel_work: "
 				       "queue_remove failed %d\n", ret);
 		wsm_unlock_tx(hw_priv);
-		//workaround by yangfh
-		up(&hw_priv->scan.lock);
+		/* The scan lock could not be taken, so it must not be
+		 * released here.  Giving it back let a scan run at the same
+		 * time as the operation that already owns it. */
 		ieee80211_connection_loss(priv->vif);
-		sta_printk(XRADIO_DBG_ERROR,"lock %d\n", hw_priv->scan.lock.count);
-		
+
 		return;
 	}
 	mutex_lock(&hw_priv->conf_mutex);
@@ -1481,7 +1508,8 @@ void xradio_join_work(struct work_struct *work)
 			if (WARN_ON(join.ssidLength > sizeof(join.ssid)))
 				join.ssidLength = sizeof(join.ssid);
 			memcpy(&join.ssid[0], &ssidie[2], join.ssidLength);
-			if(strstr(&join.ssid[0],"5.1.4"))
+			if (strnstr((char *)&join.ssid[0], "5.1.4",
+				    join.ssidLength))
 				msleep(200);
 #ifdef ROAM_OFFLOAD
 			if((priv->vif->type == NL80211_IFTYPE_STATION)) {
@@ -1595,10 +1623,9 @@ void xradio_unjoin_work(struct work_struct *work)
 
 	if (priv->join_status &&
 			priv->join_status > XRADIO_JOIN_STATUS_STA) {
-		sta_printk(XRADIO_DBG_ERROR, 
+		sta_printk(XRADIO_DBG_ERROR,
 				"%s: Unexpected: join status: %d\n",
 				__func__, priv->join_status);
-		BUG_ON(1);
 	}
 	if (priv->join_status) {
 		cancel_work_sync(&priv->update_filtering_work);
@@ -1991,9 +2018,8 @@ void xradio_rem_chan_timeout(struct work_struct *work)
 #endif
 	priv = __xrwl_hwpriv_to_vifpriv(hw_priv, if_id);
 	ret = WARN_ON(__xradio_flush(hw_priv, false, if_id));
-	if (!ret) {
+	if (!ret && priv)
 		xradio_disable_listening(priv);
-	}
 	atomic_set(&hw_priv->remain_on_channel, 0);
 	hw_priv->roc_if_id = -1;
 
